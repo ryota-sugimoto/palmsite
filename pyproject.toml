@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "palmsite"
+version = "0.1.0"
+description = "PalmSite: RdRP catalytic center predictor (simple CLI)"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [{name="Your Name"}]
+requires-python = ">=3.9"
+dependencies = [
+  "click>=8.1",
+  "numpy>=1.23",
+  "h5py>=3.10",
+  "huggingface_hub>=0.24",
+]
+
+[project.optional-dependencies]
+cpu = ["torch>=2.2,<3"]
+embed-esmc = ["esm==3.1.4"]     # local 300m/600m
+embed-forge = ["esm==3.1.4"]    # forge SDK is in the esm package too
+dev = [
+  "pytest>=7.0",
+  "ruff>=0.5",
+]
+
+[project.scripts]
+palmsite = "palmsite.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
