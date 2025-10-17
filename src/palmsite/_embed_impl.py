@@ -19,6 +19,7 @@ import logging
 import os
 import sys
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Tuple
@@ -175,6 +176,22 @@ def chunk_sequence(seq_id: str, seq: str, chunk_len: int, overlap: int) -> List[
 
 def _run(args, *, as_library: bool = False):
     logger = setup_logging(args.log_level)
+    # Silence a benign Forge/ESM SDK warning about torch.tensor(tensor).
+    # Show it once when DEBUG is enabled; otherwise ignore.
+    if logger.isEnabledFor(logging.DEBUG):
+        warnings.filterwarnings(
+            "once",
+            message=r"To copy construct from a tensor.*",
+            category=UserWarning,
+            module=r"esm\.utils\.misc",
+        )
+    else:
+        warnings.filterwarnings(
+            "ignore",
+            message=r"To copy construct from a tensor.*",
+            category=UserWarning,
+            module=r"esm\.utils\.misc",
+        )
     # Mask token in debug-dumped args
     if logger.isEnabledFor(logging.DEBUG):
         dbg = vars(args).copy()
