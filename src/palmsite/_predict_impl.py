@@ -3,32 +3,14 @@
 Predict RdRP probability and catalytic span from embeddings.h5 using a trained checkpoint,
 and (optionally) export **embedding token vectors** from the predicted catalytic region
 to an **HDF5** file. Now also saves the **final attention weights** for the exported span.
-
-New flags:
-  --extract-h5 <path>   Write HDF5 with groups under /items/<key>:
-                        - pos : int32 [N]          (positions; 0-based)
-                        - vec : float32 [N, d_model]  (embedding vectors; no positional channel)
-                        - w   : float32 [N]        (final attention weights aligned to pos/vec)
-                        <key> uses chunk_id for uniqueness; attributes also include base_id.
-  --min-p <float>       Only export vectors for chunks whose predicted P ≥ threshold (default: 0.90).
-  --h5-coords {abs,chunk}
-                        Which coordinate system to write for 'pos':
-                        - abs   : base_id + absolute 0-based AA index (default)
-                        - chunk : per-chunk 0-based index
-
-This file is the **engine** used by PalmSite’s simple CLI. It can be run directly
-as a script (CLI) or imported via `predict_from_h5(...)` by the top-level `palmsite` command.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import json
-import math
 import os
 import sys
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import h5py
@@ -52,9 +34,7 @@ def base_id_from_chunk(cid: str) -> str:
 
 
 def masked_softmax(logits: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """
-    Stable softmax with a boolean mask.
-    """
+    """Stable softmax with a boolean mask."""
     mask = mask.bool()
     very_neg = torch.finfo(logits.dtype).min / 2
     logits = logits.masked_fill(~mask, very_neg)
@@ -151,42 +131,91 @@ def collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ----------------------------
-# Model (unchanged from your training/inference)
+# Model (name-compatible with training checkpoints)
 # ----------------------------
 
 class TokenBackbone(nn.Module):
+    """
+    Backward-compatible backbone:
+    - Registers a single Sequential at `mlp` so checkpoints with keys `backbone.mlp.*` load.
+    - Provides read-only l1/l2/l3 *views* for readability (not registered).
+    """
     def __init__(self, d_in: int, p_drop: float = 0.1):
         super().__init__()
-        self.l1 = nn.Sequential(nn.LayerNorm(d_in), nn.Linear(d_in, 1024), nn.GELU(), nn.Dropout(p_drop))
-        self.l2 = nn.Sequential(nn.LayerNorm(1024), nn.Linear(1024, 512), nn.GELU(), nn.Dropout(p_drop))
-        self.l3 = nn.Sequential(nn.LayerNorm(512), nn.Linear(512, 256), nn.GELU())
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(d_in),              # mlp.0
+            nn.Linear(d_in, 1024),           # mlp.1
+            nn.GELU(),                       # mlp.2
+            nn.Dropout(p_drop),              # mlp.3
+            nn.LayerNorm(1024),              # mlp.4
+            nn.Linear(1024, 512),            # mlp.5
+            nn.GELU(),                       # mlp.6
+            nn.Dropout(p_drop),              # mlp.7
+            nn.LayerNorm(512),               # mlp.8
+            nn.Linear(512, 256),             # mlp.9
+            nn.GELU(),                       # mlp.10
+        )
 
     def forward(self, x, mask):
-        h = self.l1(x)
-        h = self.l2(h)
-        h = self.l3(h)
-        return h
+        return self.mlp(x)
 
+    # Convenience views (not registered; only for code readability if you want to inspect)
+    @property
+    def l1(self):  # LayerNorm(d_in) → Linear → GELU → Dropout
+        return nn.Sequential(*self.mlp[:4])
 
-class TokenScorer(nn.Module):
-    def __init__(self, d_in: int):
-        super().__init__()
-        self.net = nn.Sequential(nn.LayerNorm(d_in), nn.Linear(d_in, 64), nn.GELU(), nn.Dropout(0.1), nn.Linear(64, 1))
+    @property
+    def l2(self):  # LayerNorm(1024) → Linear → GELU → Dropout
+        return nn.Sequential(*self.mlp[4:8])
 
-    def forward(self, H):
-        return self.net(H).squeeze(-1)
+    @property
+    def l3(self):  # LayerNorm(512) → Linear → GELU
+        return nn.Sequential(*self.mlp[8:11])
 
 
 class RdRPModel(nn.Module):
+    """
+    Runtime model with names aligned to training:
+      - backbone.mlp.*
+      - scorer.net.*              (alias token_scorer)
+      - heads.seq_head / heads.span_head / heads.alpha_head (alpha is unused stub)
+    Aliases keep your code readable (token_scorer, seq_head, span_head).
+    """
     def __init__(self, d_in: int, tau: float = 3.0, alpha_cap: float = 2.0, p_drop: float = 0.1):
         super().__init__()
         self.backbone = TokenBackbone(d_in, p_drop=p_drop)
-        self.token_scorer = TokenScorer(256)
-        self.seq_head = nn.Sequential(nn.Linear(256 + 2, 64), nn.GELU(), nn.Dropout(0.1), nn.Linear(64, 1))
-        self.span_head = nn.Sequential(nn.Linear(256 + 2, 64), nn.GELU(), nn.Dropout(0.1), nn.Linear(64, 2))
+
+        # scorer.* (name used in checkpoints)
+        self.scorer = nn.Sequential(
+            nn.LayerNorm(256),
+            nn.Linear(256, 64),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 1),
+        )
+        # alias used in your previous runtime code
+        self.token_scorer = self.scorer
+
+        # heads.* container (names used in checkpoints)
+        seq_span_in = 256 + 2
+        self.heads = nn.Module()
+        self.heads.seq_head = nn.Sequential(
+            nn.Linear(seq_span_in, 64), nn.GELU(), nn.Dropout(0.1), nn.Linear(64, 1)
+        )
+        self.heads.span_head = nn.Sequential(
+            nn.Linear(seq_span_in, 64), nn.GELU(), nn.Dropout(0.1), nn.Linear(64, 2)
+        )
+        # unused in inference but present in some checkpoints; define to satisfy load_state_dict
+        self.heads.alpha_head = nn.Sequential(
+            nn.Linear(seq_span_in, 64), nn.GELU(), nn.Dropout(0.1), nn.Linear(64, 1)
+        )
+        # friendly aliases for code clarity
+        self.seq_head = self.heads.seq_head
+        self.span_head = self.heads.span_head
+
+        # inference knobs
         self.tau = torch.tensor(tau)
         self.alpha_cap = float(alpha_cap)
-        # Inference knobs (set from checkpoint/cfg)
         self.wmin_base = 70.0
         self.wmin_floor = 0.02
         self.lenfeat_scale = 1.0
@@ -196,38 +225,42 @@ class RdRPModel(nn.Module):
         self.tau_len_ref = 1000.0
 
     def forward(self, x, mask, L):
-        H = self.backbone(x, mask)                    # (B,T,256)
-        z = self.token_scorer(H)                      # (B,T)
-        # Gaussian attention modulation
+        H = self.backbone(x, mask)                      # (B,T,256)
+        z = self.scorer(H).squeeze(-1)                  # (B,T)
+
+        # Gaussian attention anchor via soft-argmax
         B, T = z.shape
         pos = torch.linspace(0, 1, T, device=z.device).unsqueeze(0).expand(B, T)
-        # anchor via soft-argmax
-        z_soft = masked_softmax(z / self.tau, mask, dim=-1)  # (B,T)
-        mu = (z_soft * pos).sum(dim=-1)                      # (B,)
-        # span head (S,E) in [0,1], stable param
-        len_feat = torch.stack([torch.log(L.float() + 1.0), 1.0 / (L.float().clamp(min=1.0))], dim=-1)  # (B,2)
-        pooled = (z_soft.unsqueeze(-1) * H).sum(dim=1)  # (B,256)
-        feat = torch.cat([pooled, len_feat], dim=-1)
-        logit = self.seq_head(feat).squeeze(-1)         # (B,)
-        span_raw = self.span_head(feat)                 # (B,2)
+        z_soft = masked_softmax(z / self.tau, mask, dim=-1)    # (B,T)
+        mu = (z_soft * pos).sum(dim=-1)                        # (B,)
+
+        # sequence & span heads
+        len_feat = torch.stack(
+            [torch.log(L.float() + 1.0), 1.0 / (L.float().clamp(min=1.0))], dim=-1
+        )  # (B,2)
+        pooled = (z_soft.unsqueeze(-1) * H).sum(dim=1)         # (B,256)
+        feat = torch.cat([pooled, len_feat], dim=-1)           # (B, 256+2)
+
+        logit = self.heads.seq_head(feat).squeeze(-1)          # (B,)
+        span_raw = self.heads.span_head(feat)                  # (B,2)
         S = span_raw[:, 0].sigmoid()
         l = span_raw[:, 1].sigmoid()
         E = S + l * (1 - S)
         sigma = (E - S) / (2.0 * max(self.k_sigma, 1e-6))
 
-        return {"H": H, "z": z, "z_soft": z_soft, "mu": mu, "sigma": sigma, "logit": logit, "S_pred": S, "E_pred": E}
+        return {
+            "H": H, "z": z, "z_soft": z_soft, "mu": mu, "sigma": sigma,
+            "logit": logit, "S_pred": S, "E_pred": E
+        }
 
 
 # ----------------------------
-# HPD helper (unchanged)
+# HPD helper
 # ----------------------------
 
 def _attn_hpd_span_from_out(out: Dict[str, torch.Tensor], mask: torch.Tensor, L: torch.Tensor,
                             mass: float = 0.90, pos_channel: str = 'end_inclusive') -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Given attention scores and mask, compute Highest Posterior Density (HPD) span that
-    covers `mass` of the attention. Returns (S, E, entropy) in [0,1].
-    """
+    """Compute Highest Posterior Density (HPD) span that covers `mass` of attention."""
     z = out["z_soft"].detach().cpu().numpy()
     mask_np = mask.cpu().numpy()
     B, T = z.shape
@@ -465,7 +498,7 @@ def predict_from_h5(embeddings: str, checkpoint: str, out_csv: str,
                     gff_out: str | None = None, gff_min_p: float = 0.0,
                     ids_file: str | None = None) -> None:
     """Library-friendly wrapper that calls this module as a CLI in-process."""
-    import sys, subprocess
+    import subprocess
     cmd = [sys.executable, '-m', 'palmsite._predict_impl',
            '--embeddings', embeddings,
            '--checkpoint', checkpoint,
