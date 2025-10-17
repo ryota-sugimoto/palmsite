@@ -13,6 +13,7 @@ We expose both a CLI (`python -m palmsite._embed_impl`) and a library function
 from __future__ import annotations
 
 import argparse
+import math
 import hashlib
 import logging
 import os
@@ -266,14 +267,18 @@ def _run(args, *, as_library: bool = False):
                     raise RuntimeError(msg)
                 logger.error(msg)
                 sys.exit(2)
-            client = ESM3ForgeInferenceClient(url=args.url, token=tok)
-            logits_cfg = LogitsConfig(layer="token_representations")
 
+            client = ESM3ForgeInferenceClient(model=args.model, url=args.url, token=tok)
+            logits_cfg = LogitsConfig(sequence=True, return_embeddings=True)
+            
             def embed_seq(seq: str) -> np.ndarray:
                 prot = ESMProtein(sequence=seq)
-                out = client.infer(protein=prot, logits=logits_cfg)
-                # Expect np.ndarray (T,D) from SDK
-                return out.representations  # type: ignore[attr-defined]
+                tensor = client.encode(prot)
+                if isinstance(tensor, ESMProteinError):
+                    raise RuntimeError(f"Forge encode error: {tensor}")
+                out = client.logits(tensor, logits_cfg)
+                rep = out.embeddings  # per-token embeddings
+                return np.asarray(rep)
 
         # Iterate & write
         for sid, seq in items:
@@ -418,11 +423,18 @@ def embed_fasta_to_h5(fasta: str, h5: str, model: str,
     Programmatic entrypoint used by PalmSite CLI.
     Returns stats dict: {"saved","skipped","failed_items","h5","manifest"}.
     """
-    import argparse, torch
+    import argparse
     model_res = resolve_model_name(model)
     dev = device
     if device == "auto":
-        dev = "cuda" if torch.cuda.is_available() and model_res in {"esmc_300m","esmc_600m"} else "cpu"
+        if model_res in {"esmc_300m", "esmc_600m"}:
+            try:
+                import torch  # lazy import; only needed for local models
+                dev = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                dev = "cpu"
+        else:
+            dev = "cpu"
     ns = argparse.Namespace(
         fasta=fasta, h5=h5, h5_libver=h5_libver,
         manifest=None, no_manifest_on_skip=False,

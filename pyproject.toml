@@ -15,15 +15,9 @@ dependencies = [
   "numpy>=1.23",
   "h5py>=3.10",
   "huggingface_hub>=0.24",
-]
-
-[project.optional-dependencies]
-cpu = ["torch>=2.2,<3"]
-embed-esmc = ["esm==3.1.4"]     # local 300m/600m
-embed-forge = ["esm==3.1.4"]    # forge SDK is in the esm package too
-dev = [
-  "pytest>=7.0",
-  "ruff>=0.5",
+  # Install BOTH backends by default:
+  "esm==3.1.4",
+  "torch>=2.2,<3",
 ]
 
 [project.scripts]
@@ -31,3 +25,8 @@ palmsite = "palmsite.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+exclude = ["tests*"]
+
+# ship example files if you placed them under palmsite/assets/examples/
+[tool.setuptools.package-data]
+palmsite = ["assets/examples/*"]

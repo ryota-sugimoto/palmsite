@@ -11,7 +11,7 @@ FILE_BY_BACKBONE = {
 }
 
 def resolve_hf_target(backbone: str, model_id: str | None, revision: str | None) -> Tuple[str, str, str | None]:
-    mid = model_id or os.getenv("PALMSITE_MODEL_ID") or "your-org/palmsite"
+    mid = model_id or os.getenv("PALMSITE_MODEL_ID") or "ryota-sugimoto/palmsite"
     fname = FILE_BY_BACKBONE[backbone]
     rev = revision or os.getenv("PALMSITE_MODEL_REV") or None
     return mid, fname, rev
