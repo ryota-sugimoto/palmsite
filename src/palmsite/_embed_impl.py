@@ -276,20 +276,35 @@ def _run(args, *, as_library: bool = False):
                 tensor = client.encode(prot)
                 if isinstance(tensor, ESMProteinError):
                     raise RuntimeError(f"Forge encode error: {tensor}")
-                out = client.logits(tensor, logits_cfg)
-                rep = out.embeddings  # torch.Tensor (often bfloat16 from Forge)
             
+                out = client.logits(tensor, logits_cfg)
+                rep = out.embeddings  # often a torch.Tensor with shape (1, T, D) from Forge
+            
+                # --- normalize to CPU float32 NumPy and 2-D (T, D) ---
                 try:
                     import torch
                     if isinstance(rep, torch.Tensor):
-                        rep = rep.detach().to(dtype=torch.float32, device="cpu").numpy()
+                        arr = rep.detach().to(dtype=torch.float32, device="cpu").numpy()
                     else:
-                        rep = np.asarray(rep, dtype=np.float32)
+                        arr = np.asarray(rep, dtype=np.float32)
                 except Exception:
-                    # If torch import/type-check fails for any reason, still try safe NumPy cast
-                    rep = np.asarray(rep, dtype=np.float32)
+                    arr = np.asarray(rep, dtype=np.float32)
             
-                return rep
+                # squeeze leading batch dim if present
+                if arr.ndim == 3 and arr.shape[0] == 1:
+                    arr = arr[0]
+                elif arr.ndim == 3:
+                    # fallback: flatten batch and time (rare)
+                    arr = arr.reshape(-1, arr.shape[-1])
+                elif arr.ndim == 1:
+                    raise RuntimeError(f"Forge returned 1-D embeddings (len={arr.shape[0]}), expected 2-D (T,D).")
+            
+                if arr.ndim != 2:
+                    raise RuntimeError(f"Unexpected embedding ndim={arr.ndim}, shape={arr.shape}; expected (T,D).")
+            
+                # optional trace to help future debugging
+                logging.getLogger("palmsite.embed").debug(f"Forge emb shape={arr.shape}, dtype={arr.dtype}")
+                return arr
 
         # Iterate & write
         for sid, seq in items:
