@@ -277,8 +277,19 @@ def _run(args, *, as_library: bool = False):
                 if isinstance(tensor, ESMProteinError):
                     raise RuntimeError(f"Forge encode error: {tensor}")
                 out = client.logits(tensor, logits_cfg)
-                rep = out.embeddings  # per-token embeddings
-                return np.asarray(rep)
+                rep = out.embeddings  # torch.Tensor (often bfloat16 from Forge)
+            
+                try:
+                    import torch
+                    if isinstance(rep, torch.Tensor):
+                        rep = rep.detach().to(dtype=torch.float32, device="cpu").numpy()
+                    else:
+                        rep = np.asarray(rep, dtype=np.float32)
+                except Exception:
+                    # If torch import/type-check fails for any reason, still try safe NumPy cast
+                    rep = np.asarray(rep, dtype=np.float32)
+            
+                return rep
 
         # Iterate & write
         for sid, seq in items:
