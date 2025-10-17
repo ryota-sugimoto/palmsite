@@ -49,6 +49,13 @@ def setup_logging(level: str = "INFO") -> logging.Logger:
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     return logger
 
+def _fmt_eta(seconds: Optional[float]) -> str:
+    if not seconds or not (seconds > 0) or seconds == float("inf"):
+        return "--:--:--"
+    s = int(seconds + 0.5)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 # ----------------------------
 # Model name helpers
@@ -168,6 +175,12 @@ def chunk_sequence(seq_id: str, seq: str, chunk_len: int, overlap: int) -> List[
 
 def _run(args, *, as_library: bool = False):
     logger = setup_logging(args.log_level)
+    # Mask token in debug-dumped args
+    if logger.isEnabledFor(logging.DEBUG):
+        dbg = vars(args).copy()
+        if "token" in dbg and dbg["token"]:
+            dbg["token"] = "***"
+        logger.debug(f"args={dbg}")
 
     # Resolve model + backend
     args.model = resolve_model_name(args.model)
@@ -227,6 +240,24 @@ def _run(args, *, as_library: bool = False):
         saved = 0
         skipped = 0
         failed_items: List[str] = []
+        progress_every = max(1, int(getattr(args, "progress_every", 25)))
+        # Pre-plan work to report progress/ETA
+        total_chunks = 0
+        todo_total = 0
+        for sid, seq in items:
+            if len(seq) > args.chunk_len:
+                chunks = chunk_sequence(sid, seq, args.chunk_len, args.chunk_overlap)
+            else:
+                chunks = [(f"{sid}|chunk_0001_of_0001|aa_{0:06d}_{len(seq):06d}", seq, 0, len(seq), 1, 1)]
+            total_chunks += len(chunks)
+            for cid, cseq, s0, s1, idx, total in chunks:
+                if args.skip_existing and w.exists(cid):
+                    continue
+                todo_total += 1
+        logger.info(f"Planning complete: {len(items)} sequences → {total_chunks} chunks "
+                    f"({todo_total} to embed; skip_existing={args.skip_existing}).")
+        started_at = time.time()
+        processed = 0  # chunks that were actually embedded (saved or failed)
 
         # Manifest external?
         man_fp = None
@@ -312,6 +343,8 @@ def _run(args, *, as_library: bool = False):
                      [(f"{sid}|chunk_0001_of_0001|aa_{0:06d}_{len(seq):06d}", seq, 0, len(seq), 1, 1)]
             for cid, cseq, s0, s1, idx, total in chunks:
                 if args.skip_existing and w.exists(cid):
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"skip exists: {cid}")
                     if not args.no_manifest_on_skip:
                         write_manifest_row(cid, sid, s0, s1, len(cseq), 0, args.model)
                     skipped += 1
@@ -322,6 +355,8 @@ def _run(args, *, as_library: bool = False):
                 while True:
                     attempt += 1
                     try:
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"embedding {cid} (aa={s0}-{s1}, idx={idx}/{total}, L={len(cseq)})")
                         rep = embed_seq(cseq)  # (T,D) incl BOS/EOS if present
                         # Build mask: try to detect BOS/EOS by length heuristic vs AA length
                         T, D = rep.shape
@@ -357,11 +392,31 @@ def _run(args, *, as_library: bool = False):
                         w.create(cid, emb, mask, cseq, attrs)
                         write_manifest_row(cid, sid, s0, s1, len(cseq), int(emb.shape[0]), args.model)
                         saved += 1
+                        processed += 1
+                        if (processed % progress_every == 0) or (processed == todo_total):
+                            elapsed = time.time() - started_at
+                            rate = (processed / elapsed) if elapsed > 0 else 0.0
+                            remain = max(todo_total - processed, 0)
+                            eta = (remain / rate) if rate > 0 else None
+                            pct = (100.0 * processed / max(todo_total, 1))
+                            logger.info(f"[embed] {pct:5.1f}%  {processed}/{todo_total}  "
+                                        f"| saved={saved} skipped={skipped} failed={len(failed_items)}  "
+                                        f"| {rate:.2f}/s  ETA { _fmt_eta(eta) }")
                         break
                     except Exception as e:
                         if attempt >= args.max_retries:
                             logger.error(f"FAIL {cid}: {e}")
                             failed_items.append(cid)
+                            processed += 1
+                            if (processed % progress_every == 0) or (processed == todo_total):
+                                elapsed = time.time() - started_at
+                                rate = (processed / elapsed) if elapsed > 0 else 0.0
+                                remain = max(todo_total - processed, 0)
+                                eta = (remain / rate) if rate > 0 else None
+                                pct = (100.0 * processed / max(todo_total, 1))
+                                logger.info(f"[embed] {pct:5.1f}%  {processed}/{todo_total}  "
+                                            f"| saved={saved} skipped={skipped} failed={len(failed_items)}  "
+                                            f"| {rate:.2f}/s  ETA { _fmt_eta(eta) }")
                             break
                         sleep_s = (args.retry_backoff ** (attempt - 1))
                         logger.warning(f"Retry {attempt}/{args.max_retries} after error: {e} (sleep {sleep_s:.1f}s)")
@@ -373,6 +428,9 @@ def _run(args, *, as_library: bool = False):
 
     stats = {"saved": saved, "skipped": skipped, "failed_items": failed_items,
              "h5": str(out_path), "manifest": (args.manifest or "(inside H5)")}
+    total_elapsed = time.time() - started_at
+    logger.info(f"Embedding finished in {total_elapsed:.1f}s — saved={saved}, skipped={skipped}, "
+                f"failed={len(failed_items)} → {out_path}")
     if as_library:
         return stats
     return 0
@@ -428,6 +486,8 @@ def main():
 
     # Logging
     ap.add_argument("--log-level", default="INFO", help="DEBUG|INFO|WARNING|ERROR")
+    ap.add_argument("--progress-every", type=int, default=25,
+                    help="Log a progress line after every N embedded chunks (default: 25)")
 
     args = ap.parse_args()
     _run(args, as_library=False)
@@ -471,6 +531,7 @@ def embed_fasta_to_h5(fasta: str, h5: str, model: str,
         h5_compress=h5_compress, h5_gzip_level=h5_gzip_level,
         max_retries=3, retry_backoff=2.0, sleep_ms=0,
         log_level=log_level,
+        progress_every=25,
     )
     return _run(ns, as_library=True)
 

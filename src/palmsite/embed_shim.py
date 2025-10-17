@@ -6,7 +6,9 @@ def embed_fastas_to_h5(fasta_path: str, h5_path: str,
                        backbone: str = "600m",
                        device: str = "auto",
                        token: str | None = None,
-                       quiet: bool = False):
+                       quiet: bool = False,
+                       log_level: str = "INFO",
+                       progress_every: int = 25):
     """
     Thin wrapper over your existing embedding script (packaged as palmsite._embed_impl).
     - 300m/600m → local ESM-C (HF), uses --device
@@ -37,6 +39,8 @@ def embed_fastas_to_h5(fasta_path: str, h5_path: str,
         "--chunk-len", "2000",
         "--chunk-overlap", "128",
         "--batch-size", "512",
+        "--log-level", str(log_level),
+        "--progress-every", str(int(progress_every)),
     ]
     if backbone in {"300m","600m"}:
         cmd += ["--device", dev]
