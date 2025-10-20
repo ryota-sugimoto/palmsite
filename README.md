@@ -14,7 +14,6 @@ PalmSite is a simple, fast command-line tool that predicts the **RNA-dependent R
 | 300m | 0.9991 | 0.9755 |
 
 - Detects **distant homologs** (e.g., HSRV RdRP).
-- Clear **progress logging** and fast **batched embedding** (local 300m/600m or Forge 6B).
 
 ## Installation
 
@@ -26,12 +25,14 @@ pip install palmsite
 
 ```bash
 # Basic (local 600m is default backbone)
-palmsite examples/zikavirus_proteins.fasta
+palmsite -o zikavirus_rdrp-domain.gff examples/zikavirus_proteins.fasta
+#or
+palmsite examples/zikavirus_proteins.fasta > zikavirus_rdrp-domain.gff
 
 # Quiet mode (only errors)
 palmsite -q examples/zikavirus_proteins.fasta
 
-# Raise the reporting threshold
+# Raise the reporting threshold (default 0.5)
 palmsite -p 0.9 examples/zikavirus_proteins.fasta
 
 # Use 6B (Forge); requires a token
@@ -84,7 +85,7 @@ Options:
 1. **Sanitize & merge FASTA**  
    Replaces unusual residues with `X`, drops sequences if too many fixes were needed, and writes one merged FASTA.
 2. **Embed sequences**  
-   - Launches the embedding engine (batched, token-aware micro-batching; visible progress/ETA).
+   - Launches the embedding engine.
    - Backends:
      - Local ESM-C (**300m/600m**) via Hugging Face.
      - Forge (**6B**) via the ESM SDK (`ESM3ForgeInferenceClient`).
