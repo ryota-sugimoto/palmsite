@@ -5,7 +5,7 @@ PalmSite is a simple, fast command-line tool that predicts the **RNA-dependent R
 ## Highlights
 
 - **One command** from FASTA → GFF3: `palmsite <fasta ...>`
-- **High precision and recall** (internal benchmarks):
+- **High precision and recall AUC** (internal benchmarks):
 
 | Backbone (ESM-C) | Positives vs. Negatives | Positives vs. Rest |
 |---|---:|---:|
