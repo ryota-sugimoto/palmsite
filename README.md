@@ -13,7 +13,7 @@ PalmSite is a simple, fast command-line tool that predicts the **RNA-dependent R
 | 600m | 0.9992 | 0.9687 |
 | 300m | 0.9991 | 0.9755 |
 
-- Detects **distant homologs** (e.g., HSRV RdRP).
+- Detects **distant homologs** (e.g., HSRV RdRP(Urayama et al., 2024)).
 
 ## Installation
 
@@ -25,18 +25,18 @@ pip install palmsite
 
 ```bash
 # Basic (local 600m is default backbone)
-palmsite -o zikavirus_rdrp-domain.gff examples/zikavirus_proteins.fasta
+palmsite -o hsrv_rdrp-domain.gff examples/hsrv_proteins.fasta
 #or
-palmsite examples/zikavirus_proteins.fasta > zikavirus_rdrp-domain.gff
+palmsite examples/hsrv_proteins.fasta > hsrv_rdrp-domain.gff
 
 # Quiet mode (only errors)
-palmsite -q examples/zikavirus_proteins.fasta
+palmsite -q examples/sars-cov-2_proteins.fasta
 
 # Raise the reporting threshold (default 0.5)
 palmsite -p 0.9 examples/zikavirus_proteins.fasta
 
 # Use 6B (Forge); requires a token
-palmsite -b 6b -k <FORGE_TOKEN> examples/zikavirus_proteins.fasta
+palmsite -b 6b -k <FORGE_TOKEN> examples/turnip-mosaic-virus_proteins.fasta
 # or export ESM_FORGE_TOKEN and omit -k
 ```
 
