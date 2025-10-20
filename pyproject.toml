@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "palmsite"
 version = "0.1.0"
-description = "PalmSite: RdRP catalytic center predictor (simple CLI)"
+description = "PalmSite: RdRP catalytic center predictor"
 readme = "README.md"
 license = {text = "Apache-2.0"}
-authors = [{name="Your Name"}]
+authors = [{name="Ryota Sugimoto"}]
 requires-python = ">=3.9"
 dependencies = [
   "click>=8.1",
