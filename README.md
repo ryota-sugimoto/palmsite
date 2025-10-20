@@ -18,6 +18,8 @@ PalmSite is a simple, fast command-line tool that predicts the **RNA-dependent R
 ## Installation
 
 ```bash
+conda create -n palmsite python=3.11
+conda activate palmsite
 pip install palmsite
 ```
 
@@ -114,3 +116,7 @@ Options:
 ## Version
 
 **0.1.0**
+
+## Cite
+
+Coming soon.
