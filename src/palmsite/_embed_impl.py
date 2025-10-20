@@ -441,21 +441,21 @@ def _run(args, *, as_library: bool = False):
             if dev == "auto":
                 dev = "cuda" if torch.cuda.is_available() else "cpu"
             logger.info(f"Using local ESM-C model: {args.model} on device={dev}")
-            model = ESMC.from_pretrained(args.model)
-            model = model.eval().to(dev)
+            # ESM-C local: use client-style API (ESMProtein, encode, logits)
+            from esm.sdk.api import ESMProtein as _ESMProtein, LogitsConfig as _LogitsConfig
+            model = ESMC.from_pretrained(args.model).to(dev).eval()
+            logits_cfg = _LogitsConfig(sequence=True, return_embeddings=True)
 
             def _embed_local(seq: str) -> np.ndarray:
-                toks = model.tokenizer(seq, return_tensors="pt", add_special_tokens=True).to(dev)
-                with torch.no_grad():
-                    rep = model(**toks)["representations"][model.num_layers]  # (1, T, D)
-                return _coerce_token_embeddings(rep, aa_len=len(seq))
+                prot = _ESMProtein(sequence=seq)
+                tensor = model.encode(prot)
+                out = model.logits(tensor, logits_cfg)
+                return _coerce_token_embeddings(out.embeddings, aa_len=len(seq))
 
             def _run_batch_embed(client, seq_batch: List[str]) -> List[np.ndarray]:
                 # Sequential per micro-batch to avoid GPU contention
-                outs = []
-                for s in seq_batch:
-                    outs.append(_embed_local(s))
-                return outs
+                return [_embed_local(s) for s in seq_batch]
+
         else:
             tok = args.token or os.getenv("ESM_FORGE_TOKEN")
             if not tok:
