@@ -111,11 +111,11 @@ Options:
 - `_predict_impl.py` — full predictor (model, dataset, collate).
 - `hf.py` — Hugging Face weight resolution.
 - `sanitize.py` — FASTA cleaner/merger.
-- `__init__.py` — version. Current: **0.1.0**.
+- `__init__.py` — version.
 
 ## Version
 
-**0.1.0**
+**0.1.1**
 
 ## Cite
 
