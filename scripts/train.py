@@ -731,6 +731,15 @@ class TrainConfig:
     num_workers: int = 2
     seed: int = 1337
     patience: int = 5
+    min_epochs: int = 0                 # ES cannot trigger before this
+    scheduler: str = 'cosine'           # {'cosine','warm_restarts','plateau'}
+    eta_min: float = 1e-6               # for cosine schedules
+    t0: int = 10                        # warm restarts: first cycle length
+    t_mult: float = 2.0                 # warm restarts: cycle multiplier
+    lr_patience: int = 5                # plateau: epochs without improvement
+    lr_factor: float = 0.5              # plateau: LR drop factor
+    lr_min: float = 1e-6                # plateau: minimum LR
+    wmin_anneal_epochs: int = 0         # 0 → keep “epochs//2” behavior
     amp: bool = True
     calibrate: bool = False
     # discovery knobs
@@ -749,6 +758,7 @@ class TrainConfig:
     token_dropout_protect: int = 10
     emb_noise_std: float = 0.0
     emb_noise_warmup_epochs: int = 0
+    emb_noise_decay_epochs: int = 0   # 0 = no decay (current behavior)
     crop_prob_pos: float = 0.0
     crop_prob_un: float = 0.0
     crop_windows: str = ''  # CSV
@@ -1048,7 +1058,20 @@ def train(cfg: TrainConfig) -> None:
         except Exception:
             pass
     # Optional scheduler + gradient clipping
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
+    if cfg.scheduler == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs, eta_min=cfg.eta_min)
+    elif cfg.scheduler == 'warm_restarts':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            opt, T_0=cfg.t0, T_mult=cfg.t_mult, eta_min=cfg.eta_min
+        )
+    elif cfg.scheduler == 'plateau':
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode='max', factor=cfg.lr_factor, patience=cfg.lr_patience,
+            threshold=1e-4, min_lr=cfg.lr_min, verbose=False
+        )
+    else:
+        scheduler = None
+
     MAX_NORM = 1.0
 
     # AMP (new API with fallback)
@@ -1081,8 +1104,9 @@ def train(cfg: TrainConfig) -> None:
         # Anneal wmin_base from (start) -> (final) over the first half of training
         wmin_start = float(cfg.wmin_base)
         wmin_final = float(max(0.5 * cfg.wmin_base, 20.0))  # example: halve, but not below 20 residues
-        t = min(epoch - 1, max(cfg.epochs // 2, 1))
-        frac = t / max(cfg.epochs // 2, 1)
+        W_E = (cfg.wmin_anneal_epochs if cfg.wmin_anneal_epochs > 0 else max(cfg.epochs // 2, 1))
+        t = min(epoch - 1, W_E)
+        frac = t / max(W_E, 1)
         model.wmin_base = wmin_start + (wmin_final - wmin_start) * frac
 
         # Optional PU-prior annealing
@@ -1104,12 +1128,18 @@ def train(cfg: TrainConfig) -> None:
             'loss_alpha_prior': 0.0,
             'n': 0
         }
-        # compute epoch noise sigma (warmup)
-        if cfg.emb_noise_warmup_epochs and cfg.emb_noise_warmup_epochs > 0:
+        # warmup → (optional) decay to 0
+        if cfg.emb_noise_warmup_epochs > 0:
             warm = min(epoch / max(cfg.emb_noise_warmup_epochs, 1), 1.0)
-            sigma_epoch = float(cfg.emb_noise_std) * float(warm)
+            sigma_epoch = float(cfg.emb_noise_std) * warm
         else:
             sigma_epoch = float(cfg.emb_noise_std)
+        if cfg.emb_noise_decay_epochs > 0 and epoch > cfg.min_epochs:
+            t = max(0, epoch - cfg.min_epochs)
+            frac = min(t / max(cfg.emb_noise_decay_epochs, 1), 1.0)
+            sigma_epoch = sigma_epoch * (1.0 - frac)
+
+
 
         for batch in train_loader:
             x = batch['x'].to(device)
@@ -1203,6 +1233,10 @@ def train(cfg: TrainConfig) -> None:
 
         # Step LR scheduler (epoch-wise)
         scheduler.step()
+        if cfg.scheduler == 'plateau':
+            scheduler.step(val_metrics['pr_auc_p_vs_rest'])
+        elif scheduler is not None:
+            scheduler.step()
 
         # Eval
         val_metrics = evaluate(model, val_loader, device)
@@ -1444,6 +1478,15 @@ def parse_args() -> TrainConfig:
                    help='Weight for in-sequence contrastive margin loss (positives only)')
     p.add_argument('--contrast-margin', type=float, default=0.2,
                    help='Margin for contrastive loss: max(0, m - (logit_pos - logit_neg))')
+    p.add_argument('--min-epochs', type=int, default=0)
+    p.add_argument('--scheduler', choices=['cosine','warm_restarts','plateau'], default='cosine')
+    p.add_argument('--eta-min', type=float, default=1e-6)
+    p.add_argument('--t0', type=int, default=10)
+    p.add_argument('--t-mult', type=float, default=2.0)
+    p.add_argument('--lr-patience', type=int, default=5)
+    p.add_argument('--lr-factor', type=float, default=0.5)
+    p.add_argument('--lr-min', type=float, default=1e-6)
+    p.add_argument('--wmin-anneal-epochs', type=int, default=0)
 
     args = p.parse_args()
     return TrainConfig(
