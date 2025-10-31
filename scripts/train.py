@@ -2,31 +2,34 @@
 """
 Train the RdRP detector with Gaussian attention and span localization.
 
-Major features:
+Adds three train-time augmentations (off by default, enable via flags):
+  • Token dropout on residues (protect a band around positive span center)
+  • Embedding noise on ESM channels with optional warmup/decay
+  • Random cropping (span-aware for P; random for U/N) with window set
+
+Key existing features kept:
   • Grouped split by base protein id (avoid chunk leakage)
   • nnPU + optional clean-N BCE + span loss + anchor regularizer
-  • Gaussian-pooled sequence context with width clamp (σ_min = max(wmin_base/L, wmin_floor))
-  • Optional token dropout / embedding noise (with warmup+decay) / span-aware random crops
-  • Flexible model selection metric: AP, windowed AP (ap_win), or Recall@Precision (rap)
-  • Learning-rate schedulers: cosine, cosine with warm restarts, or ReduceLROnPlateau
-  • Early stopping with a minimum-epochs guard; temperature calibration on validation
+  • Sequence head uses Gaussian context (fixed)
+  • Gaussian width clamp: σ_min = max(wmin_base/L, wmin_floor)
+  • Temperature calibration on validation set (--calibrate)
 
-Quick usage (balanced long run):
+Usage (recall‑tilted example):
 python train.py \
   --embeddings embeddings.h5 \
   --labels labels.h5 \
-  --out-dir runs/exp1 \
-  --epochs 120 --min-epochs 60 --patience 24 \
-  --scheduler warm_restarts --t0 10 --t-mult 2 --eta-min 1e-6 \
-  --pu-prior 0.30 --pu-prior-start 0.28 --pu-prior-end 0.50 --pu-prior-anneal-epochs 16 \
-  --lambda-clean-neg 0.15 --lambda-span 1.0 --lambda-anchor 0.08 \
-  --token-dropout 0.12 --token-dropout-protect 10 \
-  --emb-noise-std 0.03 --emb-noise-warmup-epochs 10 --emb-noise-decay-epochs 20 \
+  --out-dir runs/exp_recall_aug \
+  --epochs 20 --batch-size 16 --lr 1e-3 \
+  --pu-prior 0.35 \
+  --pu-prior-start 0.35 --pu-prior-end 0.50 --pu-prior-anneal-epochs 10 \
+  --lambda-clean-neg 0.15 \
+  --alpha-cap 3.0 \
+  --wmin-base 40 --wmin-floor 0.015 --lenfeat-scale 0.0 \
+  --token-dropout 0.08 --token-dropout-protect 10 \
+  --emb-noise-std 0.02 --emb-noise-warmup-epochs 5 \
   --crop-prob-pos 0.30 --crop-prob-un 0.20 \
-  --crop-windows 220,270,320,380,420,480 --crop-jitter-frac 0.125 --crop-center-only \
-  --wmin-base 80 --wmin-floor 0.025 --wmin-anneal-epochs 12 \
-  --coarse-stride 6 --lenfeat-scale 0.0 \
-  --select-metric ap \
+  --crop-windows 220,270,320,380 --crop-jitter-frac 0.125 --crop-center-only \
+  --scheduler cosine --patience 5 --min-epochs 8 \
   --calibrate
 """
 
@@ -107,12 +110,8 @@ def pr_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
         prev_r = r
     return float(ap)
 
-
 def recall_at_precision(y_true: np.ndarray, y_score: np.ndarray, min_precision: float = 0.90) -> float:
-    """
-    Maximum recall achievable while maintaining precision >= min_precision.
-    Single-number, threshold-free selector tuned for discovery.
-    """
+    """Max recall achievable while maintaining precision >= min_precision."""
     order = np.argsort(-y_score)
     y = y_true[order].astype(np.float64)
     tp = 0.0
@@ -130,7 +129,6 @@ def recall_at_precision(y_true: np.ndarray, y_score: np.ndarray, min_precision: 
             best_recall = rec
     return float(best_recall)
 
-
 def span_iou(pred_s: np.ndarray, pred_e: np.ndarray, tgt_s: np.ndarray, tgt_e: np.ndarray) -> np.ndarray:
     left = np.maximum(pred_s, tgt_s)
     right = np.minimum(pred_e, tgt_e)
@@ -139,7 +137,6 @@ def span_iou(pred_s: np.ndarray, pred_e: np.ndarray, tgt_s: np.ndarray, tgt_e: n
     with np.errstate(divide='ignore', invalid='ignore'):
         iou = np.where(union > 0, inter / union, 0.0)
     return iou
-
 
 def build_soft_span_mask_like(w_attn: torch.Tensor,
                               S: torch.Tensor, E: torch.Tensor,
@@ -162,25 +159,21 @@ def build_soft_span_mask_like(w_attn: torch.Tensor,
 
     m = torch.zeros_like(w_attn)
 
-    # Left ramp: 0→1 on [left0,left1)
     mask_l = (pos >= left0) & (pos < left1)
     den_l  = (left1 - left0).clamp_min(1e-8)
     ph_l   = (pos - left0) / den_l
     val_l  = 0.5 - 0.5 * torch.cos(torch.pi * ph_l.clamp(0,1))
     m = torch.where(mask_l, val_l, m)
 
-    # Middle: 1 on [left1,right1]
     mask_mid = (pos >= left1) & (pos <= right1)
     m = torch.where(mask_mid, torch.ones_like(m), m)
 
-    # Right ramp: 1→0 on (right1,right0]
     mask_r = (pos > right1) & (pos <= right0)
     den_r  = (right0 - right1).clamp_min(1e-8)
     ph_r   = (right0 - pos) / den_r
     val_r  = 0.5 - 0.5 * torch.cos(torch.pi * ph_r.clamp(0,1))
     m = torch.where(mask_r, val_r, m)
 
-    # Zero out padded tokens
     valid = (w_attn > 0)
     m = m * valid
     return m
@@ -191,12 +184,12 @@ def build_soft_span_mask_like(w_attn: torch.Tensor,
 
 @dataclass
 class LabelTable:
-    ids: np.ndarray            # object array of chunk_ids (strings)
-    labels: np.ndarray         # int array 0/1/2  (0=N, 1=U, 2=P)
-    L: np.ndarray              # int AA lengths
-    S: np.ndarray              # float (0..1)
-    E: np.ndarray              # float (0..1)
-    use_span: np.ndarray       # bool
+    ids: np.ndarray
+    labels: np.ndarray
+    L: np.ndarray
+    S: np.ndarray
+    E: np.ndarray
+    use_span: np.ndarray
     label_map: Dict[int, str]
 
 
@@ -226,12 +219,9 @@ class RdRPDataset(Dataset):
         self.crop_center_only = bool(crop_center_only)
         self.pos_channel = pos_channel
         self.dtype = np.float32 if dtype == 'float32' else np.float16
-        # Lazy-open per worker
         self._emb_h5: Optional[h5py.File] = None
         self._lab_h5: Optional[h5py.File] = None
-        # Load labels table fully (small)
         self.table = self._load_labels_table(labels_path)
-        # d_model can be read from first item lazily
         self._d_model_cache: Optional[int] = None
 
     @staticmethod
@@ -254,17 +244,13 @@ class RdRPDataset(Dataset):
         out: Dict[int, str] = {}
         for k, v in obj.items():
             try:
-                ik = int(k)
-                out[ik] = str(v)
+                ik = int(k); out[ik] = str(v)
             except Exception:
                 try:
-                    iv = int(v)
-                    out[iv] = str(k)
+                    iv = int(v); out[iv] = str(k)
                 except Exception:
                     pass
-        if not out:
-            out = {0: 'N', 1: 'U', 2: 'P'}
-        return out
+        return out or {0: 'N', 1: 'U', 2: 'P'}
 
     def _load_labels_table(self, path: str) -> LabelTable:
         with h5py.File(path, 'r') as h5l:
@@ -375,10 +361,9 @@ class RdRPDataset(Dataset):
         E = float(self.table.E[j])
         use_span = bool(self.table.use_span[j])
 
-        # Maybe crop (train only)
         x, S, E, use_span = self._maybe_crop(x, y, S, E, use_span)
-        L_new = x.shape[0]
 
+        L_new = x.shape[0]
         return {
             'chunk_id': cid,
             'x': torch.from_numpy(x),
@@ -398,7 +383,6 @@ class RdRPDataset(Dataset):
                 self._lab_h5.close()
         except Exception:
             pass
-
 
 def collate_batch(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     max_len = max(s['x'].shape[0] for s in samples)
@@ -470,7 +454,7 @@ class Heads(nn.Module):
             nn.Linear(256 + 2, 128), nn.ReLU(), nn.Dropout(p_drop),
             nn.Linear(128, 1)
         )
-        self.span_head = nn.Sequential(       # kept for extensibility (not used for S/E here)
+        self.span_head = nn.Sequential(
             nn.Linear(256 + 2, 128), nn.ReLU(), nn.Dropout(p_drop),
             nn.Linear(128, 2)
         )
@@ -507,37 +491,35 @@ class RdRPModel(nn.Module):
         z = self.scorer(H)              # (B,T)
         B, T, _ = H.shape
         device = x.device
-
         pos = torch.arange(T, device=device, dtype=torch.float32)[None, :].repeat(B, 1)
         denom = (L.to(torch.float32) - 1.0).clamp(min=1.0).unsqueeze(1)
         pos = (pos / denom).clamp(0.0, 1.0)
 
-        # Normalize z per sequence for stable anchoring
-        valid = mask.to(z.dtype)
-        z_mean = (z * valid).sum(dim=1, keepdim=True) / valid.sum(dim=1, keepdim=True).clamp(min=1.0)
-        z_var  = ((z - z_mean)**2 * valid).sum(dim=1, keepdim=True) / valid.sum(dim=1, keepdim=True).clamp(min=1.0)
+        # Per-sequence normalization
+        validf = mask.to(z.dtype)
+        z_mean = (z * validf).sum(dim=1, keepdim=True) / validf.sum(dim=1, keepdim=True).clamp(min=1.0)
+        z_var  = ((z - z_mean)**2 * validf).sum(dim=1, keepdim=True) / validf.sum(dim=1, keepdim=True).clamp(min=1.0)
         z_std  = z_var.add(1e-6).sqrt()
         z_norm = (z - z_mean) / z_std
 
-        # τ scaling (optional, length-aware)
+        # Length-aware τ scaling (optional)
         tau = torch.as_tensor(getattr(self, 'tau', 3.0), dtype=z.dtype, device=device)
         if getattr(self, 'tau_len_gamma', 0.0) != 0.0:
             Lf = L.to(torch.float32)
-            tau = tau * ((Lf / float(getattr(self, 'tau_len_ref', 1000.0)))
-                         .clamp(min=0.25, max=4.0) ** float(getattr(self, 'tau_len_gamma', 0.0)))
+            tau = tau * ((Lf / float(getattr(self, 'tau_len_ref', 1000.0))).clamp(0.25, 4.0) ** float(getattr(self, 'tau_len_gamma', 0.0)))
             tau = tau.view(-1, 1)
         else:
             tau = tau.view(1, 1)
 
-        # Anchor on normalized token scores
-        w_anchor = masked_softmax(z_norm / tau, mask, dim=1)  # (B,T)
+        # Anchor weights
+        w_anchor = masked_softmax(z_norm / tau, mask, dim=1)
 
         # Optional coarse-to-fine anchor
         stride = int(getattr(self, 'coarse_stride', 0) or 0)
         if stride >= 2 and T >= 2:
             very_neg = torch.finfo(z.dtype).min / 2
-            z_masked = z_norm.masked_fill(~mask, very_neg).unsqueeze(1)  # (B,1,T)
-            zc = F.max_pool1d(z_masked, kernel_size=stride, stride=stride, ceil_mode=True).squeeze(1)  # (B,Tc)
+            z_masked = z_norm.masked_fill(~mask, very_neg).unsqueeze(1)
+            zc = F.max_pool1d(z_masked, kernel_size=stride, stride=stride, ceil_mode=True).squeeze(1)
             mc = F.max_pool1d(mask.unsqueeze(1).to(z.dtype), kernel_size=stride, stride=stride, ceil_mode=True).squeeze(1) > 0
             wc = masked_softmax(zc / (tau if tau.numel() > 1 else tau), mc, dim=1)
             Tc = zc.shape[1]
@@ -558,13 +540,12 @@ class RdRPModel(nn.Module):
             var = (w_anchor * ((pos - mu.unsqueeze(1)) ** 2)).sum(dim=1)
             sigma = torch.sqrt(var + 1e-8)
 
-        # Clamp σ in [w_min, 0.5]
+        # Clamp σ
         w_min = torch.maximum(getattr(self, 'wmin_base', 70.0) / L.to(torch.float32),
                               torch.tensor(getattr(self, 'wmin_floor', 0.02), device=device))
-        sigma = torch.maximum(sigma, w_min)
-        sigma = torch.clamp(sigma, max=0.5)
+        sigma = torch.clamp(torch.maximum(sigma, w_min), max=0.5)
 
-        # Contexts and heads
+        # Context & heads
         c_anchor = torch.einsum('bt,btc->bc', w_anchor.float(), H.float()).to(H.dtype)
         lenf = self._len_feat(L)
         alpha_raw = self.heads.alpha_head(torch.cat([c_anchor, lenf], dim=-1)).squeeze(-1)
@@ -572,20 +553,17 @@ class RdRPModel(nn.Module):
         if getattr(self, 'alpha_cap', None) is not None:
             alpha = torch.clamp(alpha, max=self.alpha_cap)
 
-        q = -0.5 * ((pos - mu.unsqueeze(1)) / sigma.unsqueeze(1)).pow(2)  # (B,T)
-        z_center = z - (z * valid).sum(dim=1, keepdim=True) / valid.sum(dim=1, keepdim=True).clamp(min=1.0)
+        q = -0.5 * ((pos - mu.unsqueeze(1)) / sigma.unsqueeze(1)).pow(2)
+        z_center = z - (z * validf).sum(dim=1, keepdim=True) / validf.sum(dim=1, keepdim=True).clamp(min=1.0)
         a = z_center + alpha.unsqueeze(1) * q
         w = masked_softmax(a, mask, dim=1)
-
         c_gauss = torch.einsum('bt,btc->bc', w.float(), H.float()).to(H.dtype)
         seq_logit = self.heads.seq_head(torch.cat([c_gauss, lenf], dim=-1)).squeeze(-1)
 
-        # Span from attention mass
+        # Span from attention
         mu_attn = (w * pos).sum(dim=1)
         var_attn = (w * ((pos - mu_attn.unsqueeze(1)) ** 2)).sum(dim=1)
-        sigma_attn = torch.sqrt(var_attn + 1e-8)
-        sigma_attn = torch.maximum(sigma_attn, w_min)
-        sigma_attn = torch.clamp(sigma_attn, max=0.5)
+        sigma_attn = torch.clamp(torch.maximum(torch.sqrt(var_attn + 1e-8), w_min), max=0.5)
         k = getattr(self, 'k_sigma', 2.0)
         S = torch.clamp(mu_attn - k * sigma_attn, 0.0, 1.0)
         E = torch.clamp(mu_attn + k * sigma_attn, 0.0, 1.0)
@@ -596,7 +574,8 @@ class RdRPModel(nn.Module):
             'S_pred': S, 'E_pred': E,
             'mu': mu, 'sigma': sigma, 'alpha': alpha,
             'mu_attn': mu_attn, 'sigma_attn': sigma_attn,
-            'z': z, 'w': w, 'H': H,
+            'z': z, 'w': w,
+            'H': H,
         }
 
 # ----------------------------
@@ -604,10 +583,7 @@ class RdRPModel(nn.Module):
 # ----------------------------
 
 class NnPULoss(nn.Module):
-    """Non-negative PU risk with BCE logits.
-
-    R(f) = π * E_p[ℓ(f,1)] + max( E_u[ℓ(f,0)] - π * E_p[ℓ(f,0)] , 0 )
-    """
+    """Non-negative PU risk with BCE logits."""
     def __init__(self, pos_prior: float):
         super().__init__()
         assert 0.0 < pos_prior < 1.0, "pos_prior must be in (0,1)"
@@ -622,14 +598,9 @@ class NnPULoss(nn.Module):
             loss_p_pos = self.bce(logits[mask_p], torch.ones_like(logits[mask_p]))
             loss_p_neg = self.bce(logits[mask_p], torch.zeros_like(logits[mask_p]))
         else:
-            loss_p_pos = torch.tensor(0.0, device=logits.device)
-            loss_p_neg = torch.tensor(0.0, device=logits.device)
-        if mask_u.any():
-            loss_u_neg = self.bce(logits[mask_u], torch.zeros_like(logits[mask_u]))
-        else:
-            loss_u_neg = torch.tensor(0.0, device=logits.device)
-        risk = self.pi * loss_p_pos + torch.clamp(loss_u_neg - self.pi * loss_p_neg, min=0.0)
-        return risk
+            loss_p_pos = logits.new_tensor(0.0); loss_p_neg = logits.new_tensor(0.0)
+        loss_u_neg = self.bce(logits[mask_u], torch.zeros_like(logits[mask_u])) if mask_u.any() else logits.new_tensor(0.0)
+        return self.pi * loss_p_pos + torch.clamp(loss_u_neg - self.pi * loss_p_neg, min=0.0)
 
 
 class CleanNegLoss(nn.Module):
@@ -696,24 +667,20 @@ def _seed_worker(worker_id: int):
 
 @dataclass
 class TrainConfig:
-    # Required paths
     embeddings: str
     labels: str
     out_dir: str
-    # Runtime
     epochs: int = 30
     batch_size: int = 16
     lr: float = 1e-3
     weight_decay: float = 0.0
     dropout: float = 0.1
-    # Loss weights
     pu_prior: float = 0.2
     lambda_clean_neg: float = 0.5
     lambda_span: float = 1.0
     lambda_anchor: float = 0.2
     lambda_contrast: float = 0.0
     contrast_margin: float = 0.2
-    # Gaussian attention
     tau: float = 3.0
     alpha_cap: float = 3.0
     anchor_align_kl: float = 0.10
@@ -722,25 +689,23 @@ class TrainConfig:
     k_sigma: float = 2.0
     huber_beta: float = 0.1
     iou_weight: float = 1.0
-    # Split/IO
     train_frac: float = 0.8
     val_frac: float = 0.1
     num_workers: int = 2
     seed: int = 1337
-    # Early stopping & schedulers
     patience: int = 5
     min_epochs: int = 0                 # ES cannot trigger before this
     scheduler: str = 'cosine'           # {'cosine','warm_restarts','plateau'}
-    eta_min: float = 1e-6               # cosine schedules
+    eta_min: float = 1e-6               # for cosine schedules
     t0: int = 10                        # warm restarts: first cycle length
     t_mult: float = 2.0                 # warm restarts: cycle multiplier
-    lr_patience: int = 5                # plateau: epochs without improvement
+    lr_patience: int = 5                # plateau: epochs w/o improvement
     lr_factor: float = 0.5              # plateau: LR drop factor
     lr_min: float = 1e-6                # plateau: minimum LR
-    wmin_anneal_epochs: int = 0         # 0 → default half-epochs
+    wmin_anneal_epochs: int = 0         # 0 → use epochs//2
     amp: bool = True
     calibrate: bool = False
-    # Discovery knobs
+    # discovery knobs
     wmin_base: float = 70.0
     wmin_floor: float = 0.02
     lenfeat_scale: float = 1.0
@@ -751,7 +716,7 @@ class TrainConfig:
     pu_prior_start: Optional[float] = None
     pu_prior_end: Optional[float] = None
     pu_prior_anneal_epochs: int = 0
-    # Augmentations (train-only)
+    # augmentations (train-only)
     token_dropout: float = 0.0
     token_dropout_protect: int = 10
     emb_noise_std: float = 0.0
@@ -763,20 +728,18 @@ class TrainConfig:
     crop_jitter_frac: float = 0.125
     crop_center_only: bool = True
     pos_channel: str = 'end_inclusive'
-    # Model selection
+    # selection
     select_metric: str = 'ap'          # {'ap','ap_win','rap'}
-    select_min_precision: float = 0.90 # for 'rap'
-    select_window_len: int = 0         # for 'ap_win' (0 disables)
-    select_window_stride: int = 60     # for 'ap_win'
-    disable_iou_best: bool = False     # optional: skip saving IoU-best
-
+    select_min_precision: float = 0.90
+    select_window_len: int = 0
+    select_window_stride: int = 60
+    disable_iou_best: bool = False
 
 def base_id(cid: str) -> str:
     return str(cid).split("_chunk_")[0]
 
 
-def grouped_split(ids: np.ndarray, train_frac: float, val_frac: float, seed: int
-                  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def grouped_split(ids: np.ndarray, train_frac: float, val_frac: float, seed: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     rng = np.random.RandomState(seed)
     groups: Dict[str, List[int]] = {}
     for i, cid in enumerate(ids):
@@ -808,12 +771,10 @@ def build_datasets(cfg: TrainConfig) -> Tuple[RdRPDataset, RdRPDataset, RdRPData
             tmp = g['chunk_id'][...]
             ids = np.array([t.decode('utf-8') if isinstance(t, (bytes, bytearray)) else str(t) for t in tmp], dtype=object)
     train_idx, val_idx, test_idx = grouped_split(ids, cfg.train_frac, cfg.val_frac, cfg.seed)
-
     # Probe d_model
     tmp_ds = RdRPDataset(cfg.embeddings, cfg.labels, indices=np.array([0]))
     d_model = tmp_ds._get_d_model()
     del tmp_ds
-
     # Parse crop windows
     cw = [int(x) for x in cfg.crop_windows.split(',') if x.strip().isdigit()]
     train_ds = RdRPDataset(
@@ -828,7 +789,7 @@ def build_datasets(cfg: TrainConfig) -> Tuple[RdRPDataset, RdRPDataset, RdRPData
 
 def evaluate(model: RdRPModel, loader: DataLoader, device: torch.device) -> Dict[str, float]:
     model.eval()
-    ys, ps, ious = [], [], []
+    ys = []; ps = []; ious = []
     with torch.no_grad():
         for batch in loader:
             x = batch['x'].to(device)
@@ -843,8 +804,6 @@ def evaluate(model: RdRPModel, loader: DataLoader, device: torch.device) -> Dict
             P = torch.sigmoid(logits).detach().cpu().numpy()
             ys.append(batch['y'].cpu().numpy())
             ps.append(P)
-
-            # IoU on rows with use_span==1
             m = batch['use_span'].cpu().numpy().astype(bool)
             if m.any():
                 s_pred = out['S_pred'].detach().cpu().numpy()[m]
@@ -853,33 +812,23 @@ def evaluate(model: RdRPModel, loader: DataLoader, device: torch.device) -> Dict
                 e_t = batch['E'].cpu().numpy()[m]
                 iou = span_iou(s_pred, e_pred, s_t, e_t)
                 ious.append(iou)
-
     if not ys:
         return {'pr_auc_p_vs_rest': 0.0, 'pr_auc_p_vs_n': 0.0, 'mean_iou': 0.0, 'iou_at_0_5': 0.0}
-
     y_all = np.concatenate(ys)
     p_all = np.concatenate(ps)
     y_p_vs_rest = (y_all == 2).astype(np.int64)
     ap_rest = pr_auc(y_p_vs_rest, p_all)
     mask_n_only = (y_all != 1)
     ap_n = pr_auc(y_p_vs_rest[mask_n_only], p_all[mask_n_only]) if mask_n_only.any() else 0.0
-
     if ious:
         i_all = np.concatenate(ious)
         i_mean = float(i_all.mean())
         i_at05 = float((i_all >= 0.5).mean())
     else:
         i_mean, i_at05 = 0.0, 0.0
+    return {'pr_auc_p_vs_rest': float(ap_rest), 'pr_auc_p_vs_n': float(ap_n), 'mean_iou': i_mean, 'iou_at_0_5': i_at05}
 
-    return {'pr_auc_p_vs_rest': float(ap_rest),
-            'pr_auc_p_vs_n': float(ap_n),
-            'mean_iou': i_mean,
-            'iou_at_0_5': i_at05}
-
-
-def _collect_scores_full(model: RdRPModel, loader: DataLoader, device: torch.device
-                         ) -> Tuple[np.ndarray, np.ndarray]:
-    """Return (y_true_p_vs_rest, scores) on the full sequences (pre-calibration)."""
+def _collect_scores_full(model: RdRPModel, loader: DataLoader, device: torch.device) -> Tuple[np.ndarray, np.ndarray]:
     model.eval()
     ys, ps = [], []
     with torch.no_grad():
@@ -895,14 +844,9 @@ def _collect_scores_full(model: RdRPModel, loader: DataLoader, device: torch.dev
     return (np.concatenate(ys) if ys else np.zeros((0,), dtype=np.int64),
             np.concatenate(ps) if ps else np.zeros((0,), dtype=np.float32))
 
-
 def _collect_scores_window_max(model: RdRPModel, loader: DataLoader, device: torch.device,
                                win_len: int, win_stride: int, pos_channel: str = 'end_inclusive'
                               ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    For each sequence, slide windows and take the max-P window score.
-    Returns (y_true_p_vs_rest, scores_max) (pre-calibration).
-    """
     assert win_len and win_len > 0
     model.eval()
     ys, ps = [], []
@@ -935,14 +879,12 @@ def _collect_scores_window_max(model: RdRPModel, loader: DataLoader, device: tor
                 ys.append(y[i]); ps.append(val)
     return np.array(ys, dtype=np.int64), np.array(ps, dtype=np.float32)
 
-
 def apply_embedding_noise(x: torch.Tensor, mask: torch.Tensor, sigma: float) -> None:
     if sigma <= 0:
         return
     valid = mask.unsqueeze(-1).to(x.dtype)
     noise = torch.randn_like(x[:, :, :-1], dtype=torch.float32) * float(sigma)
     x[:, :, :-1] = x[:, :, :-1] + noise.to(x.dtype) * valid
-
 
 def apply_token_dropout(mask: torch.Tensor,
                         L: torch.Tensor,
@@ -954,7 +896,7 @@ def apply_token_dropout(mask: torch.Tensor,
                         protect: int) -> None:
     if p <= 0.0:
         return
-    B, _ = mask.shape
+    B, T = mask.shape
     device = mask.device
     for i in range(B):
         Li = int(L[i].item())
@@ -969,7 +911,6 @@ def apply_token_dropout(mask: torch.Tensor,
         if keep.sum() == 0:
             keep[random.randrange(Li)] = True
         mask[i, :Li] = mask[i, :Li] & keep
-
 
 def calibrate_temperature(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
     model.eval()
@@ -989,9 +930,12 @@ def calibrate_temperature(model: nn.Module, loader: DataLoader, device: torch.de
     z = torch.cat(logits_list)
     t = torch.cat(targets_list)
     log_T = torch.tensor(0.0, requires_grad=True)      # T = exp(log_T) > 0
-    opt = torch.optim.LBFGS([log_T], lr=0.1, max_iter=50)
-    bce = torch.nn.BCEWithLogitsLoss()
+    try:
+        opt = torch.optim.LBFGS([log_T], lr=0.1, max_iter=50)
+    except TypeError:
+        opt = torch.optim.LBFGS([log_T])
 
+    bce = torch.nn.BCEWithLogitsLoss()
     def closure():
         opt.zero_grad()
         T = torch.exp(log_T) + 1e-6
@@ -1002,7 +946,6 @@ def calibrate_temperature(model: nn.Module, loader: DataLoader, device: torch.de
     opt.step(closure)
     T = float(torch.exp(log_T).clamp(0.1, 10.0))
     return T
-
 
 def train(cfg: TrainConfig) -> None:
     if torch.cuda.is_available():
@@ -1024,8 +967,7 @@ def train(cfg: TrainConfig) -> None:
     d_in = d_model + 1  # +1 for position channel
     logging.info(f"Detected d_model={d_model}; model input dim={d_in}")
 
-    gen = torch.Generator()
-    gen.manual_seed(cfg.seed)
+    gen = torch.Generator(); gen.manual_seed(cfg.seed)
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
                               num_workers=cfg.num_workers, pin_memory=(device.type=='cuda'),
                               collate_fn=collate_batch, persistent_workers=(cfg.num_workers>0),
@@ -1050,44 +992,39 @@ def train(cfg: TrainConfig) -> None:
     model.tau_len_ref = cfg.tau_len_ref
     model.k_sigma = cfg.k_sigma
 
-    # Optimizer (alpha-head gets 2x LR and 0 WD)
+    # Parameter groups: give alpha_head a bit more LR and no WD
     base_params, alpha_params = [], []
     for n, p in model.named_parameters():
-        if 'heads.alpha_head' in n:
-            alpha_params.append(p)
-        else:
-            base_params.append(p)
+        (alpha_params if 'heads.alpha_head' in n else base_params).append(p)
     opt = torch.optim.Adam(
-        [
-            {'params': base_params, 'lr': cfg.lr, 'weight_decay': cfg.weight_decay},
-            {'params': alpha_params, 'lr': cfg.lr * 2.0, 'weight_decay': 0.0},
-        ]
+        [{'params': base_params, 'lr': cfg.lr, 'weight_decay': cfg.weight_decay},
+         {'params': alpha_params, 'lr': cfg.lr * 2.0, 'weight_decay': 0.0}]
     )
 
-    # Optional compile
+    # Optional compile (PyTorch 2.x)
     if hasattr(torch, "compile"):
         try:
             model = torch.compile(model)
         except Exception:
             pass
 
-    # Scheduler
+    # LR scheduler (chosen by --scheduler)
     if cfg.scheduler == 'cosine':
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs, eta_min=cfg.eta_min)
     elif cfg.scheduler == 'warm_restarts':
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            opt, T_0=cfg.t0, T_mult=cfg.t_mult, eta_min=cfg.eta_min
-        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=cfg.t0, T_mult=cfg.t_mult, eta_min=cfg.eta_min)
     elif cfg.scheduler == 'plateau':
+        # NOTE: No 'verbose' kwarg (for compatibility with older torch)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             opt, mode='max', factor=cfg.lr_factor, patience=cfg.lr_patience,
-            threshold=1e-4, min_lr=cfg.lr_min, verbose=False
+            threshold=1e-4, min_lr=cfg.lr_min
         )
     else:
         scheduler = None
 
     MAX_NORM = 1.0
-    # AMP
+
+    # AMP (new API with fallback)
     try:
         from torch.amp import autocast, GradScaler  # PyTorch 2.x
         _NEW_AMP = True
@@ -1101,7 +1038,6 @@ def train(cfg: TrainConfig) -> None:
     loss_span = SpanLoss(huber_beta=cfg.huber_beta, iou_weight=cfg.iou_weight)
     loss_anchor = AnchorReg(lambda_mu=cfg.lambda_anchor, lambda_sigma=cfg.lambda_anchor, k=cfg.k_sigma)
 
-    # Track winners
     best_pr   = {'pr_auc': -1.0, 'epoch': 0}
     best_iou  = {'mean_iou': -1.0, 'pr_auc': -1.0, 'epoch': 0}
     best_sel  = {'metric': cfg.select_metric, 'score': -1.0, 'epoch': 0}
@@ -1113,19 +1049,16 @@ def train(cfg: TrainConfig) -> None:
     log_rows: List[Dict[str, Any]] = []
     no_improve = 0
 
-    def _get_lr(optimizer) -> float:
-        return float(optimizer.param_groups[0]['lr'])
-
     for epoch in range(1, cfg.epochs + 1):
-        # Anneal wmin_base over a controllable horizon
+        # Anneal wmin_base over first half (or --wmin-anneal-epochs)
         wmin_start = float(cfg.wmin_base)
-        wmin_final = float(max(0.5 * cfg.wmin_base, 20.0))  # halve, but not below 20 residues
+        wmin_final = float(max(0.5 * cfg.wmin_base, 20.0))
         W_E = (cfg.wmin_anneal_epochs if cfg.wmin_anneal_epochs > 0 else max(cfg.epochs // 2, 1))
         t = min(epoch - 1, W_E)
         frac = t / max(W_E, 1)
         model.wmin_base = wmin_start + (wmin_final - wmin_start) * frac
 
-        # Optional PU prior annealing
+        # Optional PU-prior annealing
         if cfg.pu_prior_anneal_epochs and cfg.pu_prior_end is not None:
             start = cfg.pu_prior if cfg.pu_prior_start is None else cfg.pu_prior_start
             t = min(epoch - 1, cfg.pu_prior_anneal_epochs)
@@ -1134,13 +1067,11 @@ def train(cfg: TrainConfig) -> None:
 
         model.train()
         t0 = time.time()
-        running = {k: 0.0 for k in [
-            'loss_total', 'loss_cls_pu', 'loss_cls_clean', 'loss_span',
-            'loss_anchor', 'loss_align', 'loss_alpha_prior'
-        ]}
-        running['n'] = 0
+        running = {'loss_total': 0.0, 'loss_cls_pu': 0.0, 'loss_cls_clean': 0.0,
+                   'loss_span': 0.0, 'loss_anchor': 0.0, 'loss_align': 0.0,
+                   'loss_alpha_prior': 0.0, 'n': 0}
 
-        # Embedding noise schedule: warmup → (optional) decay after min_epochs
+        # Noise warmup/decay
         if cfg.emb_noise_warmup_epochs > 0:
             warm = min(epoch / max(cfg.emb_noise_warmup_epochs, 1), 1.0)
             sigma_epoch = float(cfg.emb_noise_std) * warm
@@ -1160,14 +1091,13 @@ def train(cfg: TrainConfig) -> None:
             E_t = batch['E'].to(device)
             use_span = batch['use_span'].to(device)
 
-            # Augs: drop tokens first, then add noise on kept tokens
+            # Train-time augmentations
             apply_token_dropout(mask, L, y, S_t, E_t, use_span, p=cfg.token_dropout, protect=cfg.token_dropout_protect)
             apply_embedding_noise(x, mask, sigma_epoch)
 
             opt.zero_grad(set_to_none=True)
             amp_enabled = (device.type == 'cuda' and cfg.amp)
-            ctx = (torch.amp.autocast('cuda', enabled=amp_enabled) if _NEW_AMP
-                   else torch.cuda.amp.autocast(enabled=amp_enabled))
+            ctx = autocast('cuda', enabled=amp_enabled) if _NEW_AMP else autocast(enabled=amp_enabled)
             with ctx:
                 out = model(x, mask, L)
                 logits = out['logit']
@@ -1175,32 +1105,29 @@ def train(cfg: TrainConfig) -> None:
                 l_clean = loss_clean(logits, y)
                 l_span = cfg.lambda_span * loss_span(out['S_pred'], out['E_pred'], S_t, E_t, use_span)
                 l_anchor = loss_anchor(out['mu'], out['sigma'], S_t, E_t, use_span)
-
                 # Soft alignment of attention to span (KL)
                 if cfg.anchor_align_kl > 0.0:
                     m = build_soft_span_mask_like(out['w'], S_t, E_t, ramp=cfg.anchor_align_ramp)
                     m = m / (m.sum(dim=1, keepdim=True) + 1e-8)
                     w_norm = out['w'] / (out['w'].sum(dim=1, keepdim=True) + 1e-8)
-                    kl = (w_norm.clamp_min(1e-8) * (w_norm.clamp_min(1e-8).log() - m.clamp_min(1e-8).log())).sum(dim=1)
+                    kl = (w_norm.clamp_min(1e-8) *
+                          (w_norm.clamp_min(1e-8).log() - m.clamp_min(1e-8).log())).sum(dim=1)
                     l_align = (kl * use_span.float()).mean() * cfg.anchor_align_kl
                 else:
                     l_align = logits.new_tensor(0.0)
-
                 # Tiny prior to discourage alpha→0 collapse
                 l_alpha_prior = (torch.exp(-out['alpha']).mean() * cfg.anchor_alpha_prior) if cfg.anchor_alpha_prior > 0.0 else logits.new_tensor(0.0)
 
-                # Optional in-sequence contrast
+                # In-sequence contrast (positives w/ span)
                 l_contrast = logits.new_tensor(0.0)
                 if cfg.lambda_contrast > 0.0:
                     mpos = (y == 2) & use_span
                     if mpos.any():
                         logit_pos = out['logit'][mpos]
                         Spos = S_t[mpos]; Epos = E_t[mpos]
-                        mu_neg = torch.where(
-                            (0.5 * (Spos + Epos)) < 0.5,
-                            torch.clamp(Epos + 0.2, max=1.0),
-                            torch.clamp(Spos - 0.2, min=0.0)
-                        )
+                        mu_neg = torch.where((0.5 * (Spos + Epos)) < 0.5,
+                                             torch.clamp(Epos + 0.2, max=1.0),
+                                             torch.clamp(Spos - 0.2, min=0.0))
                         sigma_neg = out['sigma'][mpos].detach()
                         zc = (out['z'][mpos] - (out['z'][mpos] * mask[mpos].to(out['z'].dtype)).sum(dim=1, keepdim=True)
                               / mask[mpos].to(out['z'].dtype).sum(dim=1, keepdim=True).clamp(min=1.0))
@@ -1225,12 +1152,12 @@ def train(cfg: TrainConfig) -> None:
             scaler.update()
 
             bs = x.size(0)
-            running['loss_total']       += float(loss.item()) * bs
-            running['loss_cls_pu']      += float(l_pu.item()) * bs
-            running['loss_cls_clean']   += float(l_clean.item()) * bs
-            running['loss_span']        += float(l_span.item()) * bs
-            running['loss_anchor']      += float(l_anchor.item()) * bs
-            running['loss_align']       += float(l_align.item()) * bs
+            running['loss_total'] += float(loss.item()) * bs
+            running['loss_cls_pu'] += float(l_pu.item()) * bs
+            running['loss_cls_clean'] += float(l_clean.item()) * bs
+            running['loss_span'] += float(l_span.item()) * bs
+            running['loss_anchor'] += float(l_anchor.item()) * bs
+            running['loss_align'] += float(l_align.item()) * bs
             running['loss_alpha_prior'] += float(l_alpha_prior.item()) * bs
             running['n'] += bs
 
@@ -1239,12 +1166,20 @@ def train(cfg: TrainConfig) -> None:
             if k != 'n':
                 running[k] = running[k] / max(running['n'], 1)
 
-        # ---- Eval first (metrics for logging, selection, and scheduler monitor)
+        # ----- Validation -----
         val_metrics = evaluate(model, val_loader, device)
+
+        # ----- Scheduler step (AFTER validation) -----
+        if scheduler is not None:
+            if cfg.scheduler == 'plateau':
+                scheduler.step(val_metrics['pr_auc_p_vs_rest'])
+            else:
+                scheduler.step()
+
+        # Log row
         row = {
             'epoch': epoch,
             'time_sec': round(train_time, 2),
-            'lr': _get_lr(opt),
             'train_loss': running['loss_total'],
             'train_loss_cls_pu': running['loss_cls_pu'],
             'train_loss_cls_clean': running['loss_cls_clean'],
@@ -1259,32 +1194,28 @@ def train(cfg: TrainConfig) -> None:
         log_rows.append(row)
 
         logging.info(
-            f"Epoch {epoch:03d} | lr={row['lr']:.2e} | pi={loss_pu.pi:.3f} | "
-            f"train={row['train_loss']:.4f} (pu={row['train_loss_cls_pu']:.3f}, "
-            f"clean={row['train_loss_cls_clean']:.3f}, span={row['train_loss_span']:.3f}, "
-            f"anchor={row['train_loss_anchor']:.3f}, align={row['train_loss_align']:.3f}, "
-            f"a_prior={row['train_loss_alpha_prior']:.3f}) | "
+            f"Epoch {epoch:03d} | pi={loss_pu.pi:.3f} | train={row['train_loss']:.4f} "
+            f"(pu={row['train_loss_cls_pu']:.3f}, clean={row['train_loss_cls_clean']:.3f}, "
+            f"span={row['train_loss_span']:.3f}, anchor={row['train_loss_anchor']:.3f}, "
+            f"align={row['train_loss_align']:.3f}, a_prior={row['train_loss_alpha_prior']:.3f}) | "
             f"val_AP(P|rest)={row['val_pr_auc_p_vs_rest']:.4f} | IoU@0.5={row['val_iou_at_0_5']:.3f} | "
             f"time={row['time_sec']:.1f}s"
         )
 
-        # Keep PR-best for reference & IoU-best optionally
+        # Winners tracking
         pr   = row['val_pr_auc_p_vs_rest']
         miou = row['val_mean_iou']
         if pr > best_pr['pr_auc'] + 1e-6:
-            best_pr['pr_auc'] = pr
-            best_pr['epoch']  = epoch
+            best_pr.update({'pr_auc': pr, 'epoch': epoch})
             torch.save({'model': model.state_dict(), 'cfg': asdict(cfg)}, best_pr_path)
             logging.info(f"Saved PR‑AUC reference checkpoint → {best_pr_path} (PR={pr:.6f})")
         if (not cfg.disable_iou_best) and (miou > best_iou['mean_iou'] + 1e-6 or
             (abs(miou - best_iou['mean_iou']) <= 1e-6 and pr > best_iou['pr_auc'] + 1e-6)):
-            best_iou['mean_iou'] = miou
-            best_iou['pr_auc']   = pr
-            best_iou['epoch']    = epoch
+            best_iou.update({'mean_iou': miou, 'pr_auc': pr, 'epoch': epoch})
             torch.save({'model': model.state_dict(), 'cfg': asdict(cfg)}, best_iou_path)
             logging.info(f"Saved IoU reference checkpoint → {best_iou_path} (mIoU={miou:.6f}, PR={pr:.6f})")
 
-        # Selection metric (drives early-stop and best checkpoint)
+        # Selection metric (drives early stopping & model_best.pt)
         if cfg.select_metric == 'ap':
             y_sel, p_sel = _collect_scores_full(model, val_loader, device)
             sel = pr_auc(y_sel, p_sel)
@@ -1297,39 +1228,35 @@ def train(cfg: TrainConfig) -> None:
                 y_sel, p_sel = _collect_scores_full(model, val_loader, device)
                 sel = pr_auc(y_sel, p_sel)
             else:
-                y_sel, p_sel = _collect_scores_window_max(
-                    model, val_loader, device, cfg.select_window_len, cfg.select_window_stride, cfg.pos_channel
-                )
+                y_sel, p_sel = _collect_scores_window_max(model, val_loader, device,
+                                                          cfg.select_window_len, cfg.select_window_stride,
+                                                          cfg.pos_channel)
                 sel = pr_auc(y_sel, p_sel)
         else:
-            sel = pr  # fallback
+            sel = pr
 
         improved_sel = (sel > best_sel['score'] + 1e-6)
         if improved_sel:
             best_sel['score'] = float(sel)
             best_sel['epoch'] = int(epoch)
             best_sel['metric'] = cfg.select_metric
-            torch.save({'model': model.state_dict(), 'cfg': asdict(cfg)}, best_path)
+            state = {'model': model.state_dict(), 'cfg': asdict(cfg)}
+            torch.save(state, best_path)
             logging.info(f"✔ New best by {cfg.select_metric}: {sel:.6f} (epoch {epoch}) → {best_path}")
 
-        # ---- Step LR scheduler exactly once, AFTER metrics exist
-        if scheduler is not None:
-            if cfg.scheduler == 'plateau':
-                monitor = float(sel)  # monitor the selection metric
-                scheduler.step(monitor)
-            else:
-                scheduler.step()
-
-        # ---- Early stopping (respect min_epochs)
-        no_improve = 0 if improved_sel else (no_improve + 1)
-        if (epoch >= cfg.min_epochs) and (no_improve >= cfg.patience):
-            logging.info(f"Early stopping after {epoch} epochs (patience {cfg.patience}).")
-            break
+        # Early stopping with min-epochs guard
+        if epoch < max(1, int(cfg.min_epochs)):
+            no_improve = 0  # do not accumulate patience before min_epochs
+        else:
+            no_improve = 0 if improved_sel else (no_improve + 1)
+            if no_improve >= cfg.patience:
+                logging.info(f"Early stopping after {epoch} epochs (patience {cfg.patience}, min_epochs {cfg.min_epochs}).")
+                break
 
     # Save last
     torch.save({'model': model.state_dict(), 'cfg': asdict(cfg)}, last_path)
 
-    # Optional calibration on the selection-best
+    # Optional calibration (on selection-best)
     temperature = None
     if cfg.calibrate:
         try:
@@ -1343,7 +1270,7 @@ def train(cfg: TrainConfig) -> None:
         except Exception as e:
             logging.warning(f"Calibration failed: {e}")
 
-    # Evaluate test on the selection-best (calibrated if available)
+    # Evaluate BEST (calibrated if available) on test
     try:
         best_ckpt = torch.load(best_path, map_location=device)
         model.load_state_dict(best_ckpt['model'])
@@ -1351,34 +1278,6 @@ def train(cfg: TrainConfig) -> None:
             model.temperature = float(best_ckpt['temperature'])
     except Exception as e:
         logging.warning(f"Could not load best checkpoint for final test; falling back to last. Error: {e}")
-
-    test_final = evaluate(model, test_loader, device)
-    with open(os.path.join(cfg.out_dir, 'test_final.json'), 'w') as f:
-        json.dump(test_final, f, indent=2)
-
-    # Also evaluate IoU-best on test set (if available)
-    if not cfg.disable_iou_best:
-        try:
-            ckpt_iou = torch.load(os.path.join(cfg.out_dir, 'model_best_iou.pt'), map_location=device)
-            model.load_state_dict(ckpt_iou['model'])
-            if hasattr(model, 'temperature'):
-                delattr(model, 'temperature')
-            test_final_iou = evaluate(model, test_loader, device)
-            with open(os.path.join(cfg.out_dir, 'test_final_best_iou.json'), 'w') as f:
-                json.dump(test_final_iou, f, indent=2)
-            logging.info("Wrote test_final_best_iou.json for IoU-best checkpoint.")
-        except Exception as e:
-            logging.warning(f"Could not evaluate IoU-best checkpoint: {e}")
-
-    # Write metrics log & inference defaults
-    metrics_obj = {'log': log_rows, 'best_sel': best_sel, 'best_by_pr': best_pr}
-    if not cfg.disable_iou_best:
-        metrics_obj['best_by_iou'] = best_iou
-    if temperature is not None:
-        metrics_obj['temperature'] = float(temperature)
-    with open(metrics_path, 'w', encoding='utf-8') as f:
-        json.dump(metrics_obj, f, indent=2)
-    logging.info(f"Saved best to {best_path} and last to {last_path}. Metrics -> {metrics_path}")
 
     try:
         infer_defaults = {
@@ -1405,97 +1304,116 @@ def train(cfg: TrainConfig) -> None:
     except Exception as e:
         logging.warning(f"Could not write inference_defaults.json: {e}")
 
+    metrics_obj = {'log': log_rows, 'best_sel': best_sel, 'best_by_pr': best_pr}
+    if not cfg.disable_iou_best:
+        metrics_obj['best_by_iou'] = best_iou
+    if temperature is not None:
+        metrics_obj['temperature'] = float(temperature)
+    with open(metrics_path, 'w', encoding='utf-8') as f:
+        json.dump(metrics_obj, f, indent=2)
+    logging.info(f"Saved best to {best_path} and last to {last_path}. Metrics -> {metrics_path}")
+
+    test_final = evaluate(model, test_loader, device)
+    with open(os.path.join(cfg.out_dir, 'test_final.json'), 'w') as f:
+        json.dump(test_final, f, indent=2)
+
+    if not cfg.disable_iou_best:
+        try:
+            ckpt_iou = torch.load(os.path.join(cfg.out_dir, 'model_best_iou.pt'), map_location=device)
+            model.load_state_dict(ckpt_iou['model'])
+            if hasattr(model, 'temperature'):
+                delattr(model, 'temperature')
+            test_final_iou = evaluate(model, test_loader, device)
+            with open(os.path.join(cfg.out_dir, 'test_final_best_iou.json'), 'w') as f:
+                json.dump(test_final_iou, f, indent=2)
+            logging.info("Wrote test_final_best_iou.json for IoU-best checkpoint.")
+        except Exception as e:
+            logging.warning(f"Could not evaluate IoU-best checkpoint: {e}")
+
 # ----------------------------
 # CLI
 # ----------------------------
 
 def parse_args() -> TrainConfig:
-    p = argparse.ArgumentParser(description='Train RdRP detector (PU + span) with optional augmentations and schedulers.')
-
+    p = argparse.ArgumentParser(description='Train RdRP detector (PU + span) with optional augmentations.')
     # Required
-    p.add_argument('--embeddings', required=True, help='Path to HDF5 with per-token embeddings under /items/<chunk_id>/emb and bool /items/<chunk_id>/mask')
-    p.add_argument('--labels', required=True, help='Path to HDF5 labels with datasets: chunk_id, label{0,1,2}, L, S, E, and optional use_span')
-    p.add_argument('--out-dir', required=True, help='Directory to write checkpoints and metrics')
-
-    # Runtime & optimization
-    p.add_argument('--epochs', type=int, default=30, help='Maximum training epochs (also T_max for cosine schedules)')
-    p.add_argument('--batch-size', type=int, default=16, help='Batch size')
-    p.add_argument('--lr', type=float, default=1e-3, help='Base learning rate for most params (alpha head gets 2x)')
-    p.add_argument('--weight-decay', type=float, default=0.0, help='L2 weight decay for base params (alpha head uses 0)')
-    p.add_argument('--dropout', type=float, default=0.1, help='Dropout rate used in MLPs')
-
-    # PU / loss weights
-    p.add_argument('--pu-prior', type=float, default=0.2, help='Estimated positive prior π (0<π<1) for nnPU risk')
-    p.add_argument('--lambda-clean-neg', type=float, default=0.5, help='Weight for BCE on clean negatives (label 0)')
-    p.add_argument('--lambda-span', type=float, default=1.0, help='Weight for span regression/IoU loss on rows with use_span=1')
-    p.add_argument('--lambda-anchor', type=float, default=0.2, help='Weight for anchor regularizer tying (mu, sigma) to span stats')
-    p.add_argument('--lambda-contrast', type=float, default=0.0, help='Weight for optional in-sequence contrastive loss on positives')
-    p.add_argument('--contrast-margin', type=float, default=0.2, help='Margin m in max(0, m - (logit_pos - logit_neg))')
-
-    # Gaussian attention controls
-    p.add_argument('--tau', type=float, default=3.0, help='Temperature for masked_softmax over tokens (lower → peakier)')
-    p.add_argument('--alpha-cap', type=float, default=3.0, help='Upper cap on alpha = softplus(alpha_raw)')
-    p.add_argument('--k-sigma', type=float, default=2.0, help='Span = mu_attn ± k*sigma_attn when deriving S/E from attention')
-    p.add_argument('--huber-beta', type=float, default=0.1, help='β for SmoothL1 in span endpoints loss')
-    p.add_argument('--iou-weight', type=float, default=1.0, help='Weight for IoU term in span loss')
-    p.add_argument('--anchor-align-kl', type=float, default=0.10, help='Weight for KL(w || soft-span-mask); 0 disables alignment')
-    p.add_argument('--anchor-align-ramp', type=float, default=0.05, help='Cosine ramp width (fraction of length) at span edges')
-    p.add_argument('--anchor-alpha-prior', type=float, default=1e-3, help='Tiny prior to discourage alpha→0 collapse')
-
+    p.add_argument('--embeddings', required=True)
+    p.add_argument('--labels', required=True)
+    p.add_argument('--out-dir', required=True)
+    # Core train
+    p.add_argument('--epochs', type=int, default=30, help='Max training epochs')
+    p.add_argument('--batch-size', type=int, default=16, help='Mini-batch size (sequences)')
+    p.add_argument('--lr', type=float, default=1e-3, help='Base learning rate (Adam)')
+    p.add_argument('--weight-decay', type=float, default=0.0, help='Weight decay on non-alpha params')
+    p.add_argument('--dropout', type=float, default=0.1, help='Dropout in token/heads MLPs')
+    # PU & losses
+    p.add_argument('--pu-prior', type=float, default=0.2, help='Estimated positive prior π on the unlabeled pool (0<π<1)')
+    p.add_argument('--lambda-clean-neg', type=float, default=0.5, help='Weight of clean-negative BCE term')
+    p.add_argument('--lambda-span', type=float, default=1.0, help='Weight of span regression + IoU loss')
+    p.add_argument('--lambda-anchor', type=float, default=0.2, help='Weight of anchor regularizer on (μ,σ)')
+    # Gaussian pooling
+    p.add_argument('--tau', type=float, default=3.0, help='Softmax temperature for anchor attention')
+    p.add_argument('--alpha-cap', type=float, default=3.0, help='Upper cap on α (strength of Gaussian bias)')
+    p.add_argument('--k-sigma', type=float, default=2.0, help='Span=μ±k·σ from attention mass')
+    p.add_argument('--huber-beta', type=float, default=0.1, help='Huber β for span regression')
+    p.add_argument('--iou-weight', type=float, default=1.0, help='Weight for (1–IoU) loss term')
+    # Data split
+    p.add_argument('--train-frac', type=float, default=0.8, help='Fraction of groups for train split')
+    p.add_argument('--val-frac', type=float, default=0.1, help='Fraction of groups for validation split')
+    p.add_argument('--num-workers', type=int, default=2, help='DataLoader workers')
+    p.add_argument('--seed', type=int, default=1337, help='Random seed for all RNGs')
+    # Early stopping / AMP / calibration
+    p.add_argument('--patience', type=int, default=5, help='Early stopping patience (epochs without selection gain)')
+    p.add_argument('--min-epochs', type=int, default=0, help='Do not early-stop before this many epochs')
+    p.add_argument('--no-amp', action='store_true', help='Disable mixed precision even on CUDA')
+    p.add_argument('--calibrate', action='store_true', help='Calibrate temperature on validation set (saves T into checkpoint)')
+    # Alignment/priors
+    p.add_argument('--anchor-align-kl', type=float, default=0.10, help='Weight for KL(w || soft-span-mask); 0 disables')
+    p.add_argument('--anchor-align-ramp', type=float, default=0.05, help='Cosine ramp width (fraction of length) on span edges')
+    p.add_argument('--anchor-alpha-prior', type=float, default=1e-3, help='Tiny prior to discourage α→0 collapse')
     # Discovery knobs
-    p.add_argument('--wmin-base', type=float, default=70.0, help='Base sigma floor in residues; σ_min = max(wmin_base/L, wmin_floor)')
-    p.add_argument('--wmin-floor', type=float, default=0.02, help='Absolute lower floor for sigma in normalized [0,1] coords')
-    p.add_argument('--wmin-anneal-epochs', type=int, default=0, help='Epochs to anneal wmin_base from start→final (0=use half of total epochs)')
-    p.add_argument('--lenfeat-scale', type=float, default=1.0, help='Scale for 2D length features [logL, 1/L]')
-    p.add_argument('--coarse-stride', type=int, default=0, help='Optional coarse stride S for anchoring (0 disables)')
-    p.add_argument('--tau-len-gamma', type=float, default=0.0, help='Exponent for length-aware τ scaling (0 disables)')
-    p.add_argument('--tau-len-ref', type=float, default=1000.0, help='Reference length for τ scaling')
-
+    p.add_argument('--wmin-base', type=float, default=70.0, help='w_min = max(wmin_base/L, wmin_floor)')
+    p.add_argument('--wmin-floor', type=float, default=0.02, help='Absolute floor for σ in [0,1]')
+    p.add_argument('--lenfeat-scale', type=float, default=1.0, help='Scale length features to reduce length bias')
+    p.add_argument('--coarse-stride', type=int, default=0, help='>0 enables coarse anchor stride (max-pool & refine)')
+    p.add_argument('--tau-len-gamma', type=float, default=0.0, help='Scale τ with length: τ·(L/ref)^gamma')
+    p.add_argument('--tau-len-ref', type=float, default=1000.0, help='Reference length used with --tau-len-gamma')
     # PU prior annealing
-    p.add_argument('--pu-prior-start', type=float, default=None, help='Start value for PU prior annealing (default uses --pu-prior)')
-    p.add_argument('--pu-prior-end', type=float, default=None, help='End value for PU prior annealing (required to enable anneal)')
-    p.add_argument('--pu-prior-anneal-epochs', type=int, default=0, help='Epochs to linearly anneal the PU prior π (0 disables)')
-
+    p.add_argument('--pu-prior-start', type=float, default=None, help='Start value for PU prior annealing (default: --pu-prior)')
+    p.add_argument('--pu-prior-end', type=float, default=None, help='End value for PU prior annealing')
+    p.add_argument('--pu-prior-anneal-epochs', type=int, default=0, help='Epochs to linearly anneal PU prior')
     # Augmentations (train-only)
-    p.add_argument('--token-dropout', type=float, default=0.0, help='Per-token drop probability (0..1)')
-    p.add_argument('--token-dropout-protect', type=int, default=10, help='Protect ±N residues around span center on positives')
-    p.add_argument('--emb-noise-std', type=float, default=0.0, help='Gaussian noise std on embedding channels')
-    p.add_argument('--emb-noise-warmup-epochs', type=int, default=0, help='Warmup epochs for noise from 0→std (0 disables)')
-    p.add_argument('--emb-noise-decay-epochs', type=int, default=0, help='After --min-epochs, linearly decay noise to 0 in this many epochs (0 disables)')
-    p.add_argument('--crop-prob-pos', type=float, default=0.0, help='Probability to crop positives with span-aware window')
-    p.add_argument('--crop-prob-un', type=float, default=0.0, help='Probability to crop unlabeled/negatives with random window')
+    p.add_argument('--token-dropout', type=float, default=0.0, help='Per-token drop probability at train-time (0..1)')
+    p.add_argument('--token-dropout-protect', type=int, default=10, help='Protect ±N residues around positive span center')
+    p.add_argument('--emb-noise-std', type=float, default=0.0, help='Gaussian noise std on embedding channels at train-time')
+    p.add_argument('--emb-noise-warmup-epochs', type=int, default=0, help='Warmup epochs for noise from 0→std')
+    p.add_argument('--emb-noise-decay-epochs', type=int, default=0, help='After --min-epochs, linearly decay noise to 0 over these epochs')
+    p.add_argument('--crop-prob-pos', type=float, default=0.0, help='Probability to crop positives during training')
+    p.add_argument('--crop-prob-un', type=float, default=0.0, help='Probability to crop unlabeled/negatives during training')
     p.add_argument('--crop-windows', type=str, default='', help='Comma-separated crop window lengths (e.g., 220,270,320,380)')
     p.add_argument('--crop-jitter-frac', type=float, default=0.125, help='Center jitter as fraction of W (e.g., 0.125 for ±W/8)')
-    p.add_argument('--crop-center-only', action='store_true', help='Require crops on positives to include the span center')
-    p.add_argument('--pos-channel', choices=['end_inclusive','end_exclusive'], default='end_inclusive',
-                   help="How to normalize the position channel: inclusive [0..1] or exclusive [0..1)")
-
+    # Make True by default but allow disabling
+    p.add_argument('--crop-center-only', dest='crop_center_only', action='store_true', help='Require crops on positives to include span center (default)')
+    p.add_argument('--no-crop-center-only', dest='crop_center_only', action='store_false', help='Allow positive crops not containing span center')
+    p.set_defaults(crop_center_only=True)
+    p.add_argument('--pos-channel', choices=['end_inclusive','end_exclusive'], default='end_inclusive', help="Position channel definition")
     # Selection strategy
     p.add_argument('--select-metric', choices=['ap','ap_win','rap'], default='ap',
-                   help="Checkpoint selection metric: 'ap' (PR‑AUC on full sequences), "
-                        "'ap_win' (PR‑AUC after sliding-window max), or 'rap' "
-                        '(Recall at Precision >= --select-min-precision)')
-    p.add_argument('--select-min-precision', type=float, default=0.90, help='Target precision for rap selection (e.g., 0.90 or 0.95)')
-    p.add_argument('--select-window-len', type=int, default=0, help='Window length for ap_win selection (0 disables ap_win)')
+                   help="Checkpoint selection metric: 'ap' (PR‑AUC), 'ap_win' (PR‑AUC after window scan), 'rap' (Recall at Precision≥--select-min-precision)")
+    p.add_argument('--select-min-precision', type=float, default=0.90, help='Target precision for RAP selection')
+    p.add_argument('--select-window-len', type=int, default=0, help='Window length for ap_win selection (0 disables)')
     p.add_argument('--select-window-stride', type=int, default=60, help='Window stride for ap_win selection')
     p.add_argument('--disable-iou-best', action='store_true', help='Do not save IoU-best checkpoint (still logged)')
-
-    # Early stopping / schedulers / misc
-    p.add_argument('--patience', type=int, default=5, help='Early stopping patience in epochs (measured on the selection metric)')
-    p.add_argument('--min-epochs', type=int, default=0, help='Minimum #epochs that must elapse before ES can trigger')
-    p.add_argument('--scheduler', choices=['cosine','warm_restarts','plateau'], default='cosine', help='Learning-rate scheduler')
-    p.add_argument('--eta-min', type=float, default=1e-6, help='eta_min for cosine / warm restarts')
-    p.add_argument('--t0', type=int, default=10, help='Warm restarts: first cycle length T0 (epochs)')
-    p.add_argument('--t-mult', type=float, default=2.0, help='Warm restarts: cycle length multiplier T_{i+1} = T_i * t_mult')
-    p.add_argument('--lr-patience', type=int, default=5, help='ReduceLROnPlateau: epochs without improvement before LR drop')
-    p.add_argument('--lr-factor', type=float, default=0.5, help='ReduceLROnPlateau: multiplicative LR drop factor')
-    p.add_argument('--lr-min', type=float, default=1e-6, help='ReduceLROnPlateau: absolute minimum LR')
-    p.add_argument('--train-frac', type=float, default=0.8, help='Fraction of base-protein groups for training set')
-    p.add_argument('--val-frac', type=float, default=0.1, help='Fraction of base-protein groups for validation set')
-    p.add_argument('--num-workers', type=int, default=2, help='Number of DataLoader workers')
-    p.add_argument('--seed', type=int, default=1337, help='Random seed')
-    p.add_argument('--no-amp', action='store_true', help='Disable mixed precision even on CUDA')
-    p.add_argument('--calibrate', action='store_true', help='Calibrate temperature on validation set and save in best checkpoint')
+    # Scheduler
+    p.add_argument('--scheduler', choices=['cosine','warm_restarts','plateau'], default='cosine',
+                   help='Learning-rate scheduler to use')
+    p.add_argument('--eta-min', type=float, default=1e-6, help='Minimum LR for cosine schedules')
+    p.add_argument('--t0', type=int, default=10, help='First cycle length for warm restarts')
+    p.add_argument('--t-mult', type=float, default=2.0, help='Cycle multiplier for warm restarts')
+    p.add_argument('--lr-patience', type=int, default=5, help='Plateau: epochs with no improvement before LR drop')
+    p.add_argument('--lr-factor', type=float, default=0.5, help='Plateau: LR reduction factor')
+    p.add_argument('--lr-min', type=float, default=1e-6, help='Plateau: minimum LR')
+    p.add_argument('--wmin-anneal-epochs', type=int, default=0, help='Epochs to linearly anneal wmin_base to final (0 → use epochs//2)')
 
     args = p.parse_args()
     return TrainConfig(
@@ -1511,8 +1429,6 @@ def parse_args() -> TrainConfig:
         lambda_clean_neg=args.lambda_clean_neg,
         lambda_span=args.lambda_span,
         lambda_anchor=args.lambda_anchor,
-        lambda_contrast=args.lambda_contrast,
-        contrast_margin=args.contrast_margin,
         tau=args.tau,
         alpha_cap=args.alpha_cap,
         anchor_align_kl=args.anchor_align_kl,
@@ -1526,29 +1442,15 @@ def parse_args() -> TrainConfig:
         num_workers=args.num_workers,
         seed=args.seed,
         patience=args.patience,
-        # ES & schedulers
         min_epochs=args.min_epochs,
-        scheduler=args.scheduler,
-        eta_min=args.eta_min,
-        t0=args.t0,
-        t_mult=args.t_mult,
-        lr_patience=args.lr_patience,
-        lr_factor=args.lr_factor,
-        lr_min=args.lr_min,
-        wmin_anneal_epochs=args.wmin_anneal_epochs,
         amp=not args.no_amp,
         calibrate=args.calibrate,
-        # discovery & PU anneal
         wmin_base=args.wmin_base,
         wmin_floor=args.wmin_floor,
         lenfeat_scale=args.lenfeat_scale,
-        coarse_stride=args.coarse_stride,
-        tau_len_gamma=args.tau_len_gamma,
-        tau_len_ref=args.tau_len_ref,
         pu_prior_start=args.pu_prior_start,
         pu_prior_end=args.pu_prior_end,
         pu_prior_anneal_epochs=args.pu_prior_anneal_epochs,
-        # augs
         token_dropout=args.token_dropout,
         token_dropout_protect=args.token_dropout_protect,
         emb_noise_std=args.emb_noise_std,
@@ -1560,12 +1462,22 @@ def parse_args() -> TrainConfig:
         crop_jitter_frac=args.crop_jitter_frac,
         crop_center_only=args.crop_center_only,
         pos_channel=args.pos_channel,
-        # selection
         select_metric=args.select_metric,
         select_min_precision=args.select_min_precision,
         select_window_len=args.select_window_len,
         select_window_stride=args.select_window_stride,
         disable_iou_best=args.disable_iou_best,
+        coarse_stride=args.coarse_stride,
+        tau_len_gamma=args.tau_len_gamma,
+        tau_len_ref=args.tau_len_ref,
+        scheduler=args.scheduler,
+        eta_min=args.eta_min,
+        t0=args.t0,
+        t_mult=args.t_mult,
+        lr_patience=args.lr_patience,
+        lr_factor=args.lr_factor,
+        lr_min=args.lr_min,
+        wmin_anneal_epochs=args.wmin_anneal_epochs,
     )
 
 if __name__ == '__main__':
