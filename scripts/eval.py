@@ -1,66 +1,77 @@
 #!/usr/bin/env python
 """
-Evaluate a trained PalmSite model on validation and test splits.
+Evaluation script for PalmSite.
 
-This script:
-  - Reconstructs the same train/val/test split as training
-    (using the cfg stored in the checkpoint + labels.h5).
-  - Loads a saved checkpoint (model_best.pt, model_best_iou.pt, etc.).
-  - Evaluates validation and/or test sets.
-  - Reports:
-      * PR-AUC (P vs rest)
-      * PR-AUC (P vs N)
-      * Mean IoU
-      * IoU >= 0.5
-      * Recall at precision >= --min-precision (P vs rest, P vs N)
+Features:
+  - Rebuilds train/val/test splits exactly as in training (same cfg, seed, labels.h5)
+  - Loads a checkpoint (e.g. model_best.pt, model_best_iou.pt)
+  - Evaluates one split: train / val / test
+  - Computes:
+      * PR-AUC (P vs rest, P vs N)
       * ROC-AUC (P vs rest, P vs N)
-  - Optionally saves PR and ROC curve data (tsv) for plotting.
+      * Mean IoU, IoU >= 0.5 (via train.evaluate)
+      * Recall at given precision thresholds
+      * PR curves (recall–precision points) for P vs rest and P vs N
+      * ROC curves (FPR–TPR points) for P vs rest and P vs N
+      * Number of samples in the evaluated split
+      * Sequence IDs for the evaluated split (optionally written to a file)
+  - Saves all metrics and curve points to a JSON file if --out-json is given.
 
-Usage example:
+Example:
 
-python eval.py \
-  --ckpt runs/exp/model_best.pt \
-  --embeddings embeddings.h5 \
-  --labels labels.h5 \
-  --min-precision 0.90 \
-  --curves-prefix runs/exp/curves \
-  --out runs/exp/eval_metrics.json
+python eval.py \\
+  --ckpt runs/exp/model_best.pt \\
+  --embeddings embeddings.h5 \\
+  --labels labels.h5 \\
+  --split test \\
+  --batch-size 32 \\
+  --num-workers 2 \\
+  --min-precision 0.90 0.95 \\
+  --out-json runs/exp/eval_test.json \\
+  --out-ids runs/exp/test_ids.txt
 """
 
+from __future__ import annotations
 import argparse
 import json
 import os
+from typing import Dict, Any, List, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+# Import core components from train.py
 from train import (
     TrainConfig,
     build_datasets,
-    RdRPModel,
     collate_batch,
+    RdRPModel,
     evaluate,
     pr_auc,
     recall_at_precision,
 )
 
 
-def collect_scores_with_labels(model: RdRPModel,
-                               loader: DataLoader,
-                               device: torch.device):
+def collect_scores_with_labels(
+    model: RdRPModel,
+    loader: DataLoader,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Collect raw labels (0/1/2), binary P-vs-rest labels, and scores for a loader.
+    Collect raw labels, scores, and chunk_ids for a given split.
 
     Returns:
-        y_raw:  np.ndarray of shape (N,), labels in {0,1,2}
-        y_bin:  np.ndarray of shape (N,), labels in {0,1}, 1 = Positive
-        scores: np.ndarray of shape (N,), sigmoid probabilities
+        y_raw:   shape (N,), values in {0,1,2} = {N, U, P}
+        y_bin:   shape (N,), values in {0,1}, 1 = Positive (P), 0 = (N or U)
+        scores:  shape (N,), sigmoid probabilities P(RdRP | sequence)
+        ids:     shape (N,), dtype=object, the chunk_ids from the dataset
     """
     model.eval()
-    ys_raw = []
-    ys_bin = []
-    scores = []
+    ys_raw: List[np.ndarray] = []
+    ys_bin: List[np.ndarray] = []
+    scores: List[np.ndarray] = []
+    ids: List[str] = []
 
     with torch.no_grad():
         for batch in loader:
@@ -68,6 +79,7 @@ def collect_scores_with_labels(model: RdRPModel,
             mask = batch["mask"].to(device)
             L = batch["L"].to(device)
             y = batch["y"].to(device)  # 0=N, 1=U, 2=P
+            chunk_ids = batch.get("chunk_ids", None)
 
             out = model(x, mask, L)
             logits = out["logit"]
@@ -77,375 +89,388 @@ def collect_scores_with_labels(model: RdRPModel,
             P = torch.sigmoid(logits).detach().cpu().numpy()
 
             y_raw = y.cpu().numpy()
-            y_bin = (y_raw == 2).astype(np.int64)  # 1 = Positive, 0 = others
+            y_bin = (y_raw == 2).astype(np.int64)
 
             ys_raw.append(y_raw)
             ys_bin.append(y_bin)
             scores.append(P)
+            if chunk_ids is not None:
+                ids.extend(list(chunk_ids))
 
     if not ys_raw:
         return (
             np.zeros((0,), dtype=np.int64),
             np.zeros((0,), dtype=np.int64),
             np.zeros((0,), dtype=np.float32),
+            np.zeros((0,), dtype=object),
         )
 
     y_raw_all = np.concatenate(ys_raw)
     y_bin_all = np.concatenate(ys_bin)
     scores_all = np.concatenate(scores)
-    return y_raw_all, y_bin_all, scores_all
+    ids_all = np.array(ids, dtype=object) if ids else np.zeros((0,), dtype=object)
+    return y_raw_all, y_bin_all, scores_all, ids_all
 
 
-def compute_pr_curve(y_true: np.ndarray, y_score: np.ndarray):
+def compute_pr_curve(y_true: np.ndarray, y_score: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compute precision-recall curve (similar to sklearn.metrics.precision_recall_curve).
-
+    Compute a simple precision-recall curve (P vs rest) without external deps.
     Returns:
-        precision: np.ndarray
-        recall:    np.ndarray
-        thresholds: np.ndarray (score thresholds)
+        recall:    shape (K,)
+        precision: shape (K,)
     """
-    y_true = np.asarray(y_true).astype(int)
-    y_score = np.asarray(y_score, dtype=np.float64)
-
-    P = float((y_true == 1).sum())
-    if P == 0 or y_true.size == 0:
-        return np.array([]), np.array([]), np.array([])
+    y_true = y_true.astype(np.int64)
+    y_score = y_score.astype(np.float64)
 
     order = np.argsort(-y_score)
-    y_sorted = y_true[order]
-    s_sorted = y_score[order]
+    y = y_true[order]
+
+    P = float((y == 1).sum())
+    if P == 0:
+        # No positives: degenerate curve
+        return np.array([0.0], dtype=np.float64), np.array([1.0], dtype=np.float64)
 
     tp = 0.0
     fp = 0.0
-    precisions = []
-    recalls = []
-    thresholds = []
-    last_score = None
+    precisions: List[float] = []
+    recalls: List[float] = []
 
-    for i in range(len(y_sorted)):
-        yi = y_sorted[i]
-        si = s_sorted[i]
-        if last_score is None or si != last_score:
-            if i > 0:
-                precision = tp / (tp + fp)
-                recall = tp / P
-                precisions.append(precision)
-                recalls.append(recall)
-                thresholds.append(last_score)
-            last_score = si
-        if yi == 1:
+    for i in range(len(y)):
+        if y[i] == 1:
             tp += 1.0
         else:
             fp += 1.0
+        prec = tp / (tp + fp)
+        rec = tp / P
+        precisions.append(prec)
+        recalls.append(rec)
 
-    # final point
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / P
-    precisions.append(precision)
-    recalls.append(recall)
-    thresholds.append(last_score)
-
-    return np.array(precisions), np.array(recalls), np.array(thresholds)
+    return np.asarray(recalls, dtype=np.float64), np.asarray(precisions, dtype=np.float64)
 
 
-def compute_roc_curve(y_true: np.ndarray, y_score: np.ndarray):
+def compute_roc_curve(y_true: np.ndarray, y_score: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compute ROC curve (FPR, TPR) and thresholds.
-
+    Compute a simple ROC curve (P vs rest) without external deps.
     Returns:
-        fpr: np.ndarray
-        tpr: np.ndarray
-        thresholds: np.ndarray
+        fpr: shape (K,)
+        tpr: shape (K,)
     """
-    y_true = np.asarray(y_true).astype(int)
-    y_score = np.asarray(y_score, dtype=np.float64)
-
-    P = float((y_true == 1).sum())
-    N = float((y_true == 0).sum())
-    if P == 0 or N == 0 or y_true.size == 0:
-        return np.array([]), np.array([]), np.array([])
+    y_true = y_true.astype(np.int64)
+    y_score = y_score.astype(np.float64)
 
     order = np.argsort(-y_score)
-    y_sorted = y_true[order]
-    s_sorted = y_score[order]
+    y = y_true[order]
+
+    P = float((y == 1).sum())
+    N = float((y == 0).sum())
+    if P == 0 or N == 0:
+        # Degenerate case
+        return np.array([0.0, 1.0], dtype=np.float64), np.array([0.0, 1.0], dtype=np.float64)
 
     tp = 0.0
     fp = 0.0
-    tprs = []
-    fprs = []
-    thresholds = []
-    last_score = None
+    tps: List[float] = []
+    fps: List[float] = []
 
-    for i in range(len(y_sorted)):
-        yi = y_sorted[i]
-        si = s_sorted[i]
-        if last_score is None or si != last_score:
-            tprs.append(tp / P)
-            fprs.append(fp / N)
-            thresholds.append(si)
-            last_score = si
-        if yi == 1:
+    for i in range(len(y)):
+        if y[i] == 1:
             tp += 1.0
         else:
             fp += 1.0
+        tps.append(tp)
+        fps.append(fp)
 
-    # append final point
-    tprs.append(tp / P)
-    fprs.append(fp / N)
-    thresholds.append(s_sorted[-1])
+    tps_arr = np.asarray(tps, dtype=np.float64)
+    fps_arr = np.asarray(fps, dtype=np.float64)
 
-    # Ensure start at (0,0)
-    if fprs[0] != 0.0 or tprs[0] != 0.0:
-        fprs.insert(0, 0.0)
-        tprs.insert(0, 0.0)
-        thresholds.insert(0, thresholds[0])
-
-    return np.array(fprs), np.array(tprs), np.array(thresholds)
+    tpr = tps_arr / P
+    fpr = fps_arr / N
+    return fpr, tpr
 
 
 def roc_auc_from_curve(fpr: np.ndarray, tpr: np.ndarray) -> float:
     """
-    Compute ROC-AUC from an ROC curve (fpr, tpr).
+    Compute ROC-AUC from FPR/TPR curve using trapezoidal rule.
     """
-    if fpr.size == 0 or tpr.size == 0:
+    if fpr.size < 2:
         return float("nan")
-    return float(np.trapz(tpr, fpr))
+    order = np.argsort(fpr)
+    fpr_s = fpr[order]
+    tpr_s = tpr[order]
+    return float(np.trapz(tpr_s, fpr_s))
 
 
-def save_pr_curve(path: str, thresholds: np.ndarray,
-                  precision: np.ndarray, recall: np.ndarray) -> None:
+def _select_dataset(split: str, train_ds, val_ds, test_ds):
+    s = split.lower()
+    if s == "train":
+        return train_ds
+    elif s in ("val", "valid", "validation"):
+        return val_ds
+    elif s == "test":
+        return test_ds
+    else:
+        raise ValueError(f"Unknown split {split!r}; use 'train', 'val', or 'test'.")
+
+
+def eval_split(
+    split_name: str,
+    model: RdRPModel,
+    loader: DataLoader,
+    device: torch.device,
+    min_precisions: List[float],
+) -> Dict[str, Any]:
     """
-    Save PR curve to a TSV file: threshold, precision, recall
-    """
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("threshold\tprecision\trecall\n")
-        for t, p, r in zip(thresholds, precision, recall):
-            f.write(f"{t:.8g}\t{p:.8g}\t{r:.8g}\n")
-
-
-def save_roc_curve(path: str, thresholds: np.ndarray,
-                   fpr: np.ndarray, tpr: np.ndarray) -> None:
-    """
-    Save ROC curve to a TSV file: threshold, fpr, tpr
-    """
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("threshold\tfpr\ttpr\n")
-        for t, x, y in zip(thresholds, fpr, tpr):
-            f.write(f"{t:.8g}\t{x:.8g}\t{y:.8g}\n")
-
-
-def eval_split(name: str,
-               model: RdRPModel,
-               loader: DataLoader,
-               device: torch.device,
-               min_precision: float,
-               curves_prefix: str | None = None):
-    """
-    Evaluate one split (val or test).
+    Evaluate a single split (train / val / test) and compute:
+      - core metrics via evaluate()
+      - recall@precision
+      - PR and ROC curves for P vs rest and P vs N
 
     Returns a dict with:
-        - pr_auc_p_vs_rest
-        - pr_auc_p_vs_n
-        - mean_iou
-        - iou_at_0_5
-        - recall_at_{min_precision}_p_vs_rest
-        - recall_at_{min_precision}_p_vs_n
-        - roc_auc_p_vs_rest
-        - roc_auc_p_vs_n
-
-    If curves_prefix is not None, also saves PR/ROC curves as TSV files.
+        {
+          "metrics": {...},
+          "curves": {...},
+          "n_samples": int,
+          "seq_ids": [id1, id2, ...]
+        }
     """
-    print(f"Evaluating on {name} ...")
+    print(f"[eval] Evaluating split={split_name} ...")
 
-    # Base summary from existing evaluate()
-    base_metrics = evaluate(model, loader, device)
+    # 1) Core metrics (PR-AUC and IoU metrics)
+    core = evaluate(model, loader, device)
 
-    # Collect labels & scores for extra metrics and curves
-    y_raw, y_bin, scores = collect_scores_with_labels(model, loader, device)
+    # 2) Collect labels, scores, and ids
+    y_raw, y_bin, scores, ids = collect_scores_with_labels(model, loader, device)
+    n_examples = int(y_raw.size)
+    print(f"[eval] Collected {n_examples} examples for split={split_name}")
 
-    metrics = dict(base_metrics)  # copy
+    metrics: Dict[str, Any] = dict(core)
 
-    # ---------- P vs rest ----------
-    if y_bin.size > 0:
-        pr_rest = pr_auc(y_bin, scores)
-        rec_rest = recall_at_precision(y_bin, scores, min_precision=min_precision)
-        prec_curve, rec_curve, thr_pr = compute_pr_curve(y_bin, scores)
-        fpr_rest, tpr_rest, thr_roc_rest = compute_roc_curve(y_bin, scores)
-        roc_rest = roc_auc_from_curve(fpr_rest, tpr_rest)
-    else:
-        pr_rest = float("nan")
-        rec_rest = float("nan")
-        roc_rest = float("nan")
-        prec_curve = rec_curve = thr_pr = np.array([])
-        fpr_rest = tpr_rest = thr_roc_rest = np.array([])
+    if n_examples == 0:
+        return {
+            "metrics": metrics,
+            "curves": {},
+            "n_samples": 0,
+            "seq_ids": [],
+        }
 
+    # 3) P vs rest (P vs {U+N})
+    pr_rest = pr_auc(y_bin, scores)
     metrics["pr_auc_p_vs_rest"] = float(pr_rest)
-    metrics[f"recall_at_precision_{min_precision}_p_vs_rest"] = float(rec_rest)
-    metrics["roc_auc_p_vs_rest"] = float(roc_rest)
 
-    # ---------- P vs N (exclude Unlabeled) ----------
+    fpr_rest, tpr_rest = compute_roc_curve(y_bin, scores)
+    roc_auc_rest = roc_auc_from_curve(fpr_rest, tpr_rest)
+    metrics["roc_auc_p_vs_rest"] = float(roc_auc_rest)
+
+    rec_rest_curve, prec_rest_curve = compute_pr_curve(y_bin, scores)
+    pr_curve_rest = {
+        "recall": rec_rest_curve.tolist(),
+        "precision": prec_rest_curve.tolist(),
+    }
+
+    for mp in min_precisions:
+        r_val = recall_at_precision(y_bin, scores, min_precision=float(mp))
+        key = f"recall_at_precision_{mp:.2f}_p_vs_rest"
+        metrics[key] = float(r_val)
+
+    # 4) P vs N (exclude Unlabeled)
     mask_n_only = (y_raw != 1)
     if mask_n_only.any():
         y_bin_n = y_bin[mask_n_only]
         scores_n = scores[mask_n_only]
+
         pr_n = pr_auc(y_bin_n, scores_n)
-        rec_n = recall_at_precision(y_bin_n, scores_n, min_precision=min_precision)
-        prec_curve_n, rec_curve_n, thr_pr_n = compute_pr_curve(y_bin_n, scores_n)
-        fpr_n, tpr_n, thr_roc_n = compute_roc_curve(y_bin_n, scores_n)
-        roc_n = roc_auc_from_curve(fpr_n, tpr_n)
+        metrics["pr_auc_p_vs_n"] = float(pr_n)
+
+        fpr_n, tpr_n = compute_roc_curve(y_bin_n, scores_n)
+        roc_auc_n = roc_auc_from_curve(fpr_n, tpr_n)
+        metrics["roc_auc_p_vs_n"] = float(roc_auc_n)
+
+        rec_n_curve, prec_n_curve = compute_pr_curve(y_bin_n, scores_n)
+        pr_curve_n = {
+            "recall": rec_n_curve.tolist(),
+            "precision": prec_n_curve.tolist(),
+        }
+
+        for mp in min_precisions:
+            r_val_n = recall_at_precision(y_bin_n, scores_n, min_precision=float(mp))
+            key_n = f"recall_at_precision_{mp:.2f}_p_vs_n"
+            metrics[key_n] = float(r_val_n)
     else:
-        pr_n = float("nan")
-        rec_n = float("nan")
-        roc_n = float("nan")
-        prec_curve_n = rec_curve_n = thr_pr_n = np.array([])
-        fpr_n = tpr_n = thr_roc_n = np.array([])
+        # No negatives in this split (very unlikely for test, but be safe)
+        fpr_n = np.array([], dtype=np.float64)
+        tpr_n = np.array([], dtype=np.float64)
+        pr_curve_n = {"recall": [], "precision": []}
+        metrics["pr_auc_p_vs_n"] = float("nan")
+        metrics["roc_auc_p_vs_n"] = float("nan")
 
-    metrics["pr_auc_p_vs_n"] = float(pr_n)
-    metrics[f"recall_at_precision_{min_precision}_p_vs_n"] = float(rec_n)
-    metrics["roc_auc_p_vs_n"] = float(roc_n)
+    curves = {
+        "pr_curve_p_vs_rest": pr_curve_rest,
+        "roc_curve_p_vs_rest": {
+            "fpr": fpr_rest.tolist(),
+            "tpr": tpr_rest.tolist(),
+        },
+        "pr_curve_p_vs_n": pr_curve_n,
+        "roc_curve_p_vs_n": {
+            "fpr": fpr_n.tolist(),
+            "tpr": tpr_n.tolist(),
+        },
+    }
 
-    # ---------- Save curves (optional) ----------
-    if curves_prefix is not None:
-        base = f"{curves_prefix}_{name}"
+    # Summary print (avoid printing full curves or id list)
+    print(f"[eval] Split={split_name} summary:")
+    print(f"  n_samples: {n_examples}")
+    print(f"  PR-AUC (P vs rest): {metrics['pr_auc_p_vs_rest']:.4f}")
+    print(f"  ROC-AUC (P vs rest): {metrics['roc_auc_p_vs_rest']:.4f}")
+    print(f"  PR-AUC (P vs N): {metrics['pr_auc_p_vs_n']:.4f}")
+    print(f"  ROC-AUC (P vs N): {metrics['roc_auc_p_vs_n']:.4f}")
+    if "mean_iou" in metrics:
+        print(f"  Mean IoU: {metrics['mean_iou']:.4f}")
+    if "iou_at_0_5" in metrics:
+        print(f"  IoU>=0.5: {metrics['iou_at_0_5']:.4f}")
+    for mp in min_precisions:
+        key_r = f"recall_at_precision_{mp:.2f}_p_vs_rest"
+        print(f"  {key_r}: {metrics[key_r]:.4f}")
 
-        # Ensure directory exists (if prefix has a directory component)
-        base_dir = os.path.dirname(base)
-        if base_dir:
-            os.makedirs(base_dir, exist_ok=True)
+    return {
+        "metrics": metrics,
+        "curves": curves,
+        "n_samples": n_examples,
+        "seq_ids": ids.tolist(),
+    }
 
-        # PR curves
-        if thr_pr.size > 0:
-            save_pr_curve(f"{base}_pr_p_vs_rest.tsv", thr_pr, prec_curve, rec_curve)
-        if thr_pr_n.size > 0:
-            save_pr_curve(f"{base}_pr_p_vs_n.tsv", thr_pr_n, prec_curve_n, rec_curve_n)
 
-        # ROC curves
-        if thr_roc_rest.size > 0:
-            save_roc_curve(f"{base}_roc_p_vs_rest.tsv", thr_roc_rest, fpr_rest, tpr_rest)
-        if thr_roc_n.size > 0:
-            save_roc_curve(f"{base}_roc_p_vs_n.tsv", thr_roc_n, fpr_n, tpr_n)
-
-    return metrics
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Evaluate a trained PalmSite model.")
+    p.add_argument("--ckpt", required=True,
+                   help="Path to checkpoint (e.g. runs/exp/model_best.pt)")
+    p.add_argument("--embeddings", default=None,
+                   help="Path to embeddings.h5 (optional; overrides cfg in checkpoint)")
+    p.add_argument("--labels", default=None,
+                   help="Path to labels.h5 (optional; overrides cfg in checkpoint)")
+    p.add_argument("--split", default="test", choices=["train", "val", "test"],
+                   help="Dataset split to evaluate (default: test)")
+    p.add_argument("--batch-size", type=int, default=32,
+                   help="Batch size for evaluation")
+    p.add_argument("--num-workers", type=int, default=2,
+                   help="Number of DataLoader workers")
+    p.add_argument(
+        "--min-precision",
+        type=float,
+        nargs="*",
+        default=[0.90],
+        help=("Precision thresholds for recall@precision (default: 0.90). "
+              "You can pass multiple values, e.g. --min-precision 0.90 0.95"),
+    )
+    p.add_argument(
+        "--out-json",
+        default=None,
+        help="Optional path to write evaluation metrics and curves as JSON "
+             "(e.g. runs/exp/eval_test.json)",
+    )
+    p.add_argument(
+        "--out-ids",
+        default=None,
+        help="Optional path to write the list of sequence IDs (one per line), "
+             "e.g. runs/exp/test_ids.txt",
+    )
+    return p.parse_args()
 
 
 def main():
-    p = argparse.ArgumentParser(description="Evaluate PalmSite model on val/test splits.")
-    p.add_argument("--ckpt", required=True,
-                   help="Path to checkpoint (e.g., runs/exp/model_best.pt)")
-    p.add_argument("--embeddings", required=True,
-                   help="Path to embeddings HDF5 file used for training")
-    p.add_argument("--labels", required=True,
-                   help="Path to labels HDF5 file used for training")
-    p.add_argument("--batch-size", type=int, default=None,
-                   help="Batch size for evaluation (default: use value from checkpoint)")
-    p.add_argument("--num-workers", type=int, default=None,
-                   help="DataLoader workers (default: use value from checkpoint)")
-    p.add_argument("--min-precision", type=float, default=0.90,
-                   help="Target precision for recall@precision metric")
-    p.add_argument("--device", type=str, default=None,
-                   help="Device: 'cuda', 'cpu', or empty for auto")
-    p.add_argument("--no-val", action="store_true",
-                   help="Skip evaluation on validation split")
-    p.add_argument("--no-test", action="store_true",
-                   help="Skip evaluation on test split")
-    p.add_argument("--curves-prefix", type=str, default=None,
-                   help=("Prefix for saving PR/ROC curves as TSV files. "
-                         "Files will be named like PREFIX_val_pr_p_vs_rest.tsv, etc."))
-    p.add_argument("--out", type=str, default=None,
-                   help="Optional path to JSON file to store results")
+    args = parse_args()
 
-    args = p.parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[eval] Using device: {device}")
 
-    if args.device is None or args.device == "":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
-
-    print(f"Using device: {device}")
-
-    # Load checkpoint & config
+    # Load checkpoint and reconstruct config
     ckpt = torch.load(args.ckpt, map_location=device)
-    cfg_dict = ckpt.get("cfg", None)
-    if cfg_dict is None:
-        raise RuntimeError("Checkpoint does not contain 'cfg' field with TrainConfig.")
+    if "cfg" not in ckpt:
+        raise RuntimeError("Checkpoint does not contain 'cfg'; ensure it was saved by train.py.")
+    cfg = TrainConfig(**ckpt["cfg"])
 
-    cfg = TrainConfig(**cfg_dict)
-    # Override paths/batch size/workers from CLI
-    cfg.embeddings = args.embeddings
-    cfg.labels = args.labels
-    if args.batch_size is not None:
-        cfg.batch_size = args.batch_size
-    if args.num_workers is not None:
-        cfg.num_workers = args.num_workers
+    # Override embeddings/labels from CLI if provided
+    if args.embeddings is not None:
+        cfg.embeddings = args.embeddings
+    if args.labels is not None:
+        cfg.labels = args.labels
 
-    # Rebuild datasets & loaders
+    # Build datasets (same split as training)
     train_ds, val_ds, test_ds, d_model = build_datasets(cfg)
-    d_in = d_model + 1  # +1 positional channel
-    pin_memory = (device.type == "cuda")
+    print(f"[eval] d_model={d_model}")
 
-    val_loader = DataLoader(
-        val_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, pin_memory=pin_memory,
+    ds = _select_dataset(args.split, train_ds, val_ds, test_ds)
+
+    loader = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
         collate_fn=collate_batch,
     )
-    test_loader = DataLoader(
-        test_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, pin_memory=pin_memory,
-        collate_fn=collate_batch,
-    )
 
-    # Build model & restore state
-    model = RdRPModel(d_in=d_in, tau=cfg.tau, alpha_cap=cfg.alpha_cap,
-                      p_drop=cfg.dropout).to(device)
-    # Discovery knobs (must mirror train())
+    # Build model
+    d_in = d_model + 1  # +1 for position channel
+    model = RdRPModel(d_in=d_in, tau=cfg.tau, alpha_cap=cfg.alpha_cap, p_drop=cfg.dropout).to(device)
+
+    # Inject discovery knobs for consistency with training
     model.wmin_base = cfg.wmin_base
     model.wmin_floor = cfg.wmin_floor
-    model.seq_pool = 'gauss'
+    model.seq_pool = "gauss"
     model.lenfeat_scale = cfg.lenfeat_scale
     model.coarse_stride = cfg.coarse_stride
     model.tau_len_gamma = cfg.tau_len_gamma
     model.tau_len_ref = cfg.tau_len_ref
     model.k_sigma = cfg.k_sigma
 
+    # Load weights
     model.load_state_dict(ckpt["model"])
 
-    # Optional temperature
+    # Optional temperature calibration
     if "temperature" in ckpt:
         model.temperature = float(ckpt["temperature"])
-        print(f"Loaded calibrated temperature: T = {model.temperature:.3f}")
+        print(f"[eval] Loaded calibrated temperature: T={model.temperature:.3f}")
 
-    model.eval()
+    # Run evaluation on the requested split
+    split_result = eval_split(
+        split_name=args.split,
+        model=model,
+        loader=loader,
+        device=device,
+        min_precisions=args.min_precision,
+    )
 
-    results = {
+    seq_ids = split_result.pop("seq_ids")
+    n_samples = split_result["n_samples"]
+
+    # Assemble top-level result object
+    result_out: Dict[str, Any] = {
         "checkpoint": os.path.abspath(args.ckpt),
-        "min_precision": args.min_precision,
+        "split": args.split,
+        "min_precisions": args.min_precision,
+        "n_samples": n_samples,
+        "metrics": split_result["metrics"],
+        "curves": split_result["curves"],
     }
 
-    # Evaluate val
-    if not args.no_val:
-        metrics_val = eval_split("val", model, val_loader, device,
-                                 args.min_precision, args.curves_prefix)
-        results["val"] = metrics_val
-
-    # Evaluate test
-    if not args.no_test:
-        metrics_test = eval_split("test", model, test_loader, device,
-                                  args.min_precision, args.curves_prefix)
-        results["test"] = metrics_test
-
-    # Print to stdout
-    print("\n=== Evaluation results ===")
-    print(json.dumps(results, indent=2))
-
     # Save JSON if requested
-    if args.out:
-        out_dir = os.path.dirname(args.out)
+    if args.out_json is not None:
+        out_dir = os.path.dirname(args.out_json)
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
-        with open(args.out, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2)
-        print(f"\nSaved results to {args.out}")
+        with open(args.out_json, "w", encoding="utf-8") as f:
+            json.dump(result_out, f, indent=2)
+        print(f"[eval] Wrote metrics+curves JSON to {args.out_json}")
+
+    # Save sequence IDs if requested
+    if args.out_ids is not None:
+        out_dir_ids = os.path.dirname(args.out_ids)
+        if out_dir_ids:
+            os.makedirs(out_dir_ids, exist_ok=True)
+        with open(args.out_ids, "w", encoding="utf-8") as f:
+            for cid in seq_ids:
+                f.write(f"{cid}\n")
+        print(f"[eval] Wrote {n_samples} sequence IDs to {args.out_ids}")
 
 
 if __name__ == "__main__":
