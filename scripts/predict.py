@@ -2,7 +2,8 @@
 """
 Predict RdRP probability and catalytic span from embeddings.h5 using a trained checkpoint,
 and (optionally) export **embedding token vectors** from the predicted catalytic region
-to an **HDF5** file. Now also saves the **final attention weights** for the exported span.
+to an **HDF5** file. Now also saves the **final attention weights** for the exported span,
+and (optionally) per-residue attention weights + mu/sigma to a JSON file.
 
 New flags:
   --extract-h5 <path>   Write HDF5 with groups under /items/<key>:
@@ -15,6 +16,7 @@ New flags:
                         Which coordinate system to write for 'pos':
                         - abs   : base_id + absolute 0-based AA index (default)
                         - chunk : chunk_id + chunk-local 0-based index
+  --attn-json <path>    Write residue-wise attention weights and mu/sigma per chunk as JSON.
 
 Discovery mode and window scan are supported; HDF5 export is based on the per-chunk span S..E.
 
@@ -442,6 +444,12 @@ def main():
     ap.add_argument('--extract-h5', default=None, help='Path to HDF5 to write embedding vectors for catalytic spans')
     ap.add_argument('--min-p', type=float, default=0.90, help='Only export vectors for rows with P >= this threshold (default: 0.90)')
     ap.add_argument('--h5-coords', choices=['abs','chunk'], default='abs', help="Coordinate system for HDF5 pos: 'abs' (base_id, absolute 0-based AA) or 'chunk' (chunk_id, chunk-local index)")
+    # --- NEW: per-residue attention JSON output ---
+    ap.add_argument(
+        '--attn-json',
+        default=None,
+        help='Optional path to write residue-wise attention weights and mu/sigma per chunk as JSON.'
+    )
 
     args = ap.parse_args()
 
@@ -563,7 +571,7 @@ def main():
 
     amp_enabled = (device.type == 'cuda' and (not args.no_amp))
 
-    # Optional attention weights dump
+    # Optional attention weights dump (legacy, not used in JSON mode)
     dump_weights_id = args.dump_weights_id
     dump_path = None
     if dump_weights_id:
@@ -590,6 +598,9 @@ def main():
         h5o.attrs['span_source'] = span_src
         h5o.attrs['weight_type'] = 'final_attention'  # document what "w" is
         items_group = h5o.create_group('items')
+
+    # Optional JSON for residue-wise attention
+    attn_json: Optional[Dict[str, Any]] = {} if args.attn_json else None
 
     # Write per-chunk CSV incrementally
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
@@ -620,6 +631,27 @@ def main():
                 orig_len = batch['orig_len'].cpu().numpy().astype(int)
                 # final attention over valid tokens
                 w_full = out['w'].detach().cpu().numpy()  # (B, T)
+
+                # --- NEW: per-residue attention JSON storage ---
+                if attn_json is not None:
+                    for i, cid in enumerate(batch['chunk_ids']):
+                        Li = int(Lcpu[i])
+                        if Li <= 0:
+                            continue
+                        wi = w_full[i, :Li].astype(float, copy=False)
+                        ostart = int(orig_start[i])
+                        olen_i = int(orig_len[i])
+                        abs_pos = (ostart + np.arange(Li, dtype=int)).tolist()
+                        attn_json[cid] = {
+                            "L": Li,
+                            "orig_start": ostart,
+                            "orig_len": olen_i,
+                            "mu": float(mu[i]),
+                            "sigma": float(sigma[i]),
+                            "w": wi.tolist(),
+                            "abs_pos": abs_pos,
+                        }
+
                 # indices under end-inclusive mapping
                 S_idx = np.round(S * (Lcpu - 1)).astype(int)
                 E_idx = np.round(E * (Lcpu - 1)).astype(int)
@@ -633,8 +665,8 @@ def main():
                     writer.writerow([cid, float(P[i]), float(S[i]), float(E[i]), int(S_idx[i]), int(E_idx[i]), float(mu[i]), int(mu_idx[i]), float(sigma[i]), int(Lcpu[i])])
                     # aggregate best per base id
                     bid = base_id_from_chunk(cid)
-                    cur = agg.get(bid)
                     cand = (float(P[i]), cid, int(abs_S[i]), int(abs_E[i]), int(orig_start[i] + mu_idx[i]), float(sigma[i]), int(orig_len[i]), float(S[i]), float(E[i]), 0.0)
+                    cur = agg.get(bid)
                     if (cur is None) or (cand[0] > cur[0]):
                         agg[bid] = cand
                     # HDF5 export for vectors + weights
@@ -712,7 +744,8 @@ def main():
                                 starts.append(Li - win)
                         # build window minibatches
                         emb_i = x[i, :Li, :-1].cpu().numpy()  # strip pos
-                        best = agg[base_id_from_chunk(batch['chunk_ids'][i])] if base_id_from_chunk(batch['chunk_ids'][i]) in agg else None
+                        bid_i = base_id_from_chunk(batch['chunk_ids'][i])
+                        best = agg.get(bid_i)
                         for k in range(0, len(starts), 64):  # process in minibatches
                             sub = starts[k:k+64]
                             Xw = []
@@ -761,15 +794,21 @@ def main():
                                     aS = int(batch['orig_start'][i].cpu().item()) + s0 + Sidx
                                     aE = int(batch['orig_start'][i].cpu().item()) + s0 + Eidx
                                     aMu = int(batch['orig_start'][i].cpu().item()) + s0 + muidx
-                                    bid = base_id_from_chunk(batch['chunk_ids'][i])
                                     best = (Pj, f"{batch['chunk_ids'][i]}:win{s0}-{s0+L_w}",
                                             aS, aE, aMu, float(sigw[j]), int(batch['orig_len'][i].cpu().item()),
                                             float(Sw[j]), float(Ew[j]), 0.0)
-                                    agg[bid] = best
+                                    agg[bid_i] = best
 
     # Close HDF5 if open
     if h5o is not None:
         h5o.close()
+
+    # Write attention JSON if requested
+    if attn_json is not None:
+        os.makedirs(os.path.dirname(args.attn_json) or '.', exist_ok=True)
+        with open(args.attn_json, 'w', encoding='utf-8') as fjson:
+            json.dump(attn_json, fjson, indent=2)
+        print(f"Wrote residue-wise attention weights to: {args.attn_json}")
 
     # Base-level CSV
     if args.base_out:
@@ -829,4 +868,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
