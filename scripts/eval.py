@@ -4,7 +4,7 @@ Evaluation script for PalmSite.
 
 Features:
   - Rebuilds train/val/test splits exactly as in training (same cfg, seed, labels.h5)
-  - Loads a checkpoint (e.g. model_best.pt, model_best_iou.pt)
+  - Loads a checkpoint (e.g., model_best.pt, model_best_iou.pt)
   - Evaluates one split: train / val / test
   - Computes:
       * PR-AUC (P vs rest, P vs N)
@@ -13,9 +13,10 @@ Features:
       * Recall at given precision thresholds
       * PR curves (recall–precision points) for P vs rest and P vs N
       * ROC curves (FPR–TPR points) for P vs rest and P vs N
-      * Number of samples in the evaluated split
+      * Number of samples and P/U/N counts for the evaluated split
       * Sequence IDs for the evaluated split (optionally written to a file)
   - Saves all metrics and curve points to a JSON file if --out-json is given.
+  - Optionally saves PR/ROC curves as TSV files via --curves-prefix.
 
 Example:
 
@@ -27,6 +28,7 @@ python eval.py \\
   --batch-size 32 \\
   --num-workers 2 \\
   --min-precision 0.90 0.95 \\
+  --curves-prefix runs/exp/palmsite_curves \\
   --out-json runs/exp/eval_test.json \\
   --out-ids runs/exp/test_ids.txt
 """
@@ -212,6 +214,64 @@ def _select_dataset(split: str, train_ds, val_ds, test_ds):
         raise ValueError(f"Unknown split {split!r}; use 'train', 'val', or 'test'.")
 
 
+def save_curves_tsv(curves: Dict[str, Any], prefix: str, split: str) -> None:
+    """
+    Save PR/ROC curves for a split as TSV files.
+
+    Files:
+      prefix_<split>_pr_p_vs_rest.tsv   (recall, precision)
+      prefix_<split>_roc_p_vs_rest.tsv  (fpr, tpr)
+      prefix_<split>_pr_p_vs_n.tsv      (recall, precision)
+      prefix_<split>_roc_p_vs_n.tsv     (fpr, tpr)
+    """
+    os.makedirs(os.path.dirname(prefix) or ".", exist_ok=True)
+    base = f"{prefix}_{split}"
+
+    # P vs rest
+    pr_rest = curves.get("pr_curve_p_vs_rest", {})
+    roc_rest = curves.get("roc_curve_p_vs_rest", {})
+    rec_rest = np.array(pr_rest.get("recall", []), dtype=float)
+    prec_rest = np.array(pr_rest.get("precision", []), dtype=float)
+    fpr_rest = np.array(roc_rest.get("fpr", []), dtype=float)
+    tpr_rest = np.array(roc_rest.get("tpr", []), dtype=float)
+
+    pr_rest_path = f"{base}_pr_p_vs_rest.tsv"
+    roc_rest_path = f"{base}_roc_p_vs_rest.tsv"
+    with open(pr_rest_path, "w", encoding="utf-8") as f:
+        f.write("recall\tprecision\n")
+        for r, p in zip(rec_rest, prec_rest):
+            f.write(f"{r:.8g}\t{p:.8g}\n")
+    with open(roc_rest_path, "w", encoding="utf-8") as f:
+        f.write("fpr\ttpr\n")
+        for x, y in zip(fpr_rest, tpr_rest):
+            f.write(f"{x:.8g}\t{y:.8g}\n")
+
+    # P vs N
+    pr_n = curves.get("pr_curve_p_vs_n", {})
+    roc_n = curves.get("roc_curve_p_vs_n", {})
+    rec_n = np.array(pr_n.get("recall", []), dtype=float)
+    prec_n = np.array(pr_n.get("precision", []), dtype=float)
+    fpr_n = np.array(roc_n.get("fpr", []), dtype=float)
+    tpr_n = np.array(roc_n.get("tpr", []), dtype=float)
+
+    pr_n_path = f"{base}_pr_p_vs_n.tsv"
+    roc_n_path = f"{base}_roc_p_vs_n.tsv"
+    with open(pr_n_path, "w", encoding="utf-8") as f:
+        f.write("recall\tprecision\n")
+        for r, p in zip(rec_n, prec_n):
+            f.write(f"{r:.8g}\t{p:.8g}\n")
+    with open(roc_n_path, "w", encoding="utf-8") as f:
+        f.write("fpr\ttpr\n")
+        for x, y in zip(fpr_n, tpr_n):
+            f.write(f"{x:.8g}\t{y:.8g}\n")
+
+    print(f"[eval] Saved curves to:")
+    print(f"  {pr_rest_path}")
+    print(f"  {roc_rest_path}")
+    print(f"  {pr_n_path}")
+    print(f"  {roc_n_path}")
+
+
 def eval_split(
     split_name: str,
     model: RdRPModel,
@@ -252,6 +312,14 @@ def eval_split(
             "n_samples": 0,
             "seq_ids": [],
         }
+
+    # P/U/N counts
+    n_pos = int((y_raw == 2).sum())
+    n_unlabeled = int((y_raw == 1).sum())
+    n_neg = int((y_raw == 0).sum())
+    metrics["n_pos"] = n_pos
+    metrics["n_unlabeled"] = n_unlabeled
+    metrics["n_neg"] = n_neg
 
     # 3) P vs rest (P vs {U+N})
     pr_rest = pr_auc(y_bin, scores)
@@ -296,7 +364,7 @@ def eval_split(
             key_n = f"recall_at_precision_{mp:.2f}_p_vs_n"
             metrics[key_n] = float(r_val_n)
     else:
-        # No negatives in this split (very unlikely for test, but be safe)
+        # No negatives in this split (unlikely for test, but be safe)
         fpr_n = np.array([], dtype=np.float64)
         tpr_n = np.array([], dtype=np.float64)
         pr_curve_n = {"recall": [], "precision": []}
@@ -318,7 +386,7 @@ def eval_split(
 
     # Summary print (avoid printing full curves or id list)
     print(f"[eval] Split={split_name} summary:")
-    print(f"  n_samples: {n_examples}")
+    print(f"  n_samples: {n_examples} (P={n_pos}, U={n_unlabeled}, N={n_neg})")
     print(f"  PR-AUC (P vs rest): {metrics['pr_auc_p_vs_rest']:.4f}")
     print(f"  ROC-AUC (P vs rest): {metrics['roc_auc_p_vs_rest']:.4f}")
     print(f"  PR-AUC (P vs N): {metrics['pr_auc_p_vs_n']:.4f}")
@@ -360,6 +428,12 @@ def parse_args() -> argparse.Namespace:
         default=[0.90],
         help=("Precision thresholds for recall@precision (default: 0.90). "
               "You can pass multiple values, e.g. --min-precision 0.90 0.95"),
+    )
+    p.add_argument(
+        "--curves-prefix",
+        default=None,
+        help=("Optional prefix for saving PR/ROC curves as TSV. "
+              "Example: runs/exp/curves -> runs/exp/curves_test_pr_p_vs_rest.tsv"),
     )
     p.add_argument(
         "--out-json",
@@ -452,6 +526,10 @@ def main():
         "metrics": split_result["metrics"],
         "curves": split_result["curves"],
     }
+
+    # Optionally write curves TSV
+    if args.curves_prefix is not None:
+        save_curves_tsv(result_out["curves"], args.curves_prefix, args.split)
 
     # Save JSON if requested
     if args.out_json is not None:
