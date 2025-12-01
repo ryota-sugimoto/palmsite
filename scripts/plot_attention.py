@@ -7,7 +7,8 @@ Aggregation strategy:
   - For each chunk, we add its attention weights w[pos_local] into a global
     full_w[pos_abs] (sum over chunks).
   - Likewise, we add the chunk's Gaussian g_chunk[pos_local] into full_g[pos_abs].
-  - Then we normalize full_w and full_g by their global maxima for plotting.
+  - Then we (optionally) smooth full_w/full_g with a moving average and
+    normalize them by their global maxima for plotting.
 
 This emphasizes residues that are consistently attended across overlapping chunks
 (e.g., a true catalytic palm) and downweights isolated spikes from a single chunk.
@@ -46,7 +47,7 @@ This script:
 import argparse
 import json
 import os
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -162,7 +163,9 @@ def aggregate_full_length_for_base(
             idx_local_arr = np.arange(L, dtype=float)
             denom = float(max(L - 1, 1))
             pos_norm = idx_local_arr / denom
-            g_chunk = np.exp(-0.5 * ((pos_norm - mu_attn) / max(sigma_attn, 1e-8)) ** 2)
+            g_chunk = np.exp(
+                -0.5 * ((pos_norm - mu_attn) / max(sigma_attn, 1e-8)) ** 2
+            )
             gmax = float(g_chunk.max()) if g_chunk.size > 0 else 1.0
             if gmax > 0.0:
                 g_chunk = g_chunk / gmax
@@ -202,6 +205,25 @@ def aggregate_full_length_for_base(
     return full_w, full_g, orig_len, best_span, best_cid
 
 
+def smooth_1d(arr: np.ndarray, k: int) -> np.ndarray:
+    """
+    Simple moving-average smoother with window size k.
+
+    - If k <= 1, returns arr unchanged.
+    - Uses 'edge' padding so the output has the same length as input.
+    """
+    if arr.size == 0 or k <= 1:
+        return arr
+    k = int(k)
+    if k < 2:
+        return arr
+    pad_left = k // 2
+    pad_right = k - 1 - pad_left
+    padded = np.pad(arr, (pad_left, pad_right), mode="edge")
+    kernel = np.ones(k, dtype=float) / float(k)
+    return np.convolve(padded, kernel, mode="valid")
+
+
 def plot_full_attention(
     base_id: str,
     full_w: np.ndarray,
@@ -211,6 +233,7 @@ def plot_full_attention(
     best_cid: str,
     out_path: str,
     one_based: bool = True,
+    smooth_window: int = 1,
 ) -> None:
     """Plot full-length attention/Gaussian for a base_id."""
 
@@ -220,9 +243,11 @@ def plot_full_attention(
     x = np.arange(orig_len, dtype=float)
     x_plot = x + 1.0 if one_based else x
 
+    # Optional smoothing BEFORE normalization
+    w = smooth_1d(full_w.copy(), smooth_window)
+    g = smooth_1d(full_g.copy(), smooth_window)
+
     # Normalize attention and Gaussian
-    w = full_w.copy()
-    g = full_g.copy()
     w_max = float(w.max()) if w.size > 0 else 1.0
     g_max = float(g.max()) if g.size > 0 else 1.0
     if w_max > 0.0:
@@ -270,7 +295,7 @@ def plot_full_attention(
     plt.ylabel("Normalized weight")
     plt.title(
         f"Full-length attention for {base_id}\n"
-        f"(orig_len={orig_len}, best_chunk={best_cid})"
+        f"(orig_len={orig_len}, best_chunk={best_cid}, smooth_window={smooth_window})"
     )
     plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
     plt.legend(fontsize=8, loc="upper right")
@@ -280,7 +305,10 @@ def plot_full_attention(
     plt.savefig(out_path, dpi=300)
     plt.close()
 
-    print(f"[plot] Saved full-length attention plot for base_id='{base_id}' to: {out_path}")
+    print(
+        f"[plot] Saved full-length attention plot for base_id='{base_id}' "
+        f"to: {out_path} (smooth_window={smooth_window})"
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -319,6 +347,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use 0-based residue positions on X axis instead of 1-based.",
     )
+    p.add_argument(
+        "--smooth-window",
+        type=int,
+        default=1,
+        help=(
+            "Window size (in residues) for moving-average smoothing of curves. "
+            "1 = no smoothing (default)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -344,6 +381,7 @@ def main():
         best_cid=best_cid,
         out_path=args.out,
         one_based=not args.zero_based,
+        smooth_window=int(args.smooth_window),
     )
 
 
