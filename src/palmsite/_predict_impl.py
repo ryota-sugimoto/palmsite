@@ -17,6 +17,7 @@ import argparse
 import csv
 import os
 import sys
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import h5py
@@ -459,6 +460,9 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
     # Aggregate best per base_id
     agg: Dict[str, Tuple[float, str, int, int, int, float, int, float, float, float]] = {}
 
+    # Optional per-residue attention JSON output
+    attn_json: Optional[Dict[str, Any]] = {} if getattr(args, "attn_json", None) else None
+
     with torch.no_grad():
         for b in dl:
             x = b["x"].to(device)
@@ -476,12 +480,56 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
 
             mu    = out["mu"].detach().cpu().numpy()
             sigma = out["sigma"].detach().cpu().numpy()
+
+            # final-attention-based parameters (for JSON reporting)
+            mu_attn = out["mu_attn"].detach().cpu().numpy()
+            sigma_attn = out["sigma_attn"].detach().cpu().numpy()
+            w_full = out["w"].detach().cpu().numpy()  # (B, T)
+
             Lnp   = b["L"].detach().cpu().numpy().astype(int)
             S_idx = np.round(S * (Lnp - 1)).astype(int)
             E_idx = np.round(E * (Lnp - 1)).astype(int)
             mu_idx= np.round(mu * (Lnp - 1)).astype(int)
             orig_start = b["orig_start"].detach().cpu().numpy().astype(int)
             orig_len   = b["orig_len"].detach().cpu().numpy().astype(int)
+
+            # Optional per-residue attention JSON storage (one object per chunk_id)
+            if attn_json is not None:
+                for i, cid in enumerate(b["chunk_ids"]):
+                    Li = int(Lnp[i])
+                    if Li <= 0:
+                        continue
+                    wi = w_full[i, :Li].astype(float, copy=False)
+                    ostart = int(orig_start[i])
+                    olen_i = int(orig_len[i])
+                    abs_pos = (ostart + np.arange(Li, dtype=int)).tolist()
+
+                    attn_json[cid] = {
+                        "L": Li,
+                        "orig_start": ostart,
+                        "orig_len": olen_i,
+
+                        # anchor-based parameters
+                        "mu": float(mu[i]),
+                        "sigma": float(sigma[i]),
+
+                        # final-attention-based parameters
+                        "mu_attn": float(mu_attn[i]),
+                        "sigma_attn": float(sigma_attn[i]),
+
+                        # span information (matches what GFF uses)
+                        "S_norm": float(S[i]),
+                        "E_norm": float(E[i]),
+                        "S_idx": int(S_idx[i]),
+                        "E_idx": int(E_idx[i]),
+
+                        # probability for convenience
+                        "P": float(P[i]),
+
+                        # per-residue final attention weights and positions
+                        "w": wi.tolist(),
+                        "abs_pos": abs_pos,
+                    }
 
             for i, cid in enumerate(b["chunk_ids"]):
                 wcsv.writerow([cid, float(P[i]), float(S[i]), float(E[i]),
@@ -502,6 +550,13 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
                     agg[bid] = cand
 
     fcsv.close()
+
+    # Write attention JSON to disk if requested
+    if attn_json is not None and getattr(args, "attn_json", None):
+        os.makedirs(os.path.dirname(args.attn_json) or ".", exist_ok=True)
+        with open(args.attn_json, "w", encoding="utf-8") as fjson:
+            json.dump(attn_json, fjson, indent=2)
+        print(f"Wrote residue-wise attention weights to: {args.attn_json}")
 
     # Base-level TSV
     if args.base_out:
@@ -580,6 +635,12 @@ def main():
     ap.add_argument("--discovery", action="store_true", help="Use HPD span instead of k·sigma")
     ap.add_argument("--attn_mass", type=float, default=0.90)
 
+    ap.add_argument(
+        "--attn-json",
+        default=None,
+        help="Optional path to write residue-wise attention weights and mu/sigma per chunk as JSON.",
+    )
+
     ap.add_argument("--window-scan", type=int, default=None)
     ap.add_argument("--window-stride", type=int, default=50)
     ap.add_argument("--coarse-stride", type=int, default=None)
@@ -598,7 +659,8 @@ def main():
 
 def predict_from_h5(embeddings: str, checkpoint: str, out_csv: str,
                     gff_out: str | None = None, gff_min_p: float = 0.0,
-                    ids_file: str | None = None) -> None:
+                    ids_file: str | None = None,
+                    attn_json: str | None = None) -> None:
     """Library-friendly wrapper that calls this module as a CLI in-process."""
     import subprocess
     cmd = [sys.executable, '-m', 'palmsite._predict_impl',
@@ -610,6 +672,8 @@ def predict_from_h5(embeddings: str, checkpoint: str, out_csv: str,
         cmd += ['--gff-out', gff_out]
     if ids_file is not None:
         cmd += ['--ids-file', ids_file]
+    if attn_json is not None:
+        cmd += ['--attn-json', attn_json]
     proc = subprocess.run(cmd, text=True, capture_output=True)
     if proc.returncode != 0:
         raise RuntimeError(f"predict_from_h5 failed: {proc.stderr.strip()}")
