@@ -141,6 +141,22 @@ def plot_attention(
         plt.axvspan(left_plot, right_plot, color="grey", alpha=0.15, label=f"μ ± {k_sigma:.1f}σ (approx.)")
         plt.axvline(mu_plot, color="black", linestyle=":", linewidth=1.0, label="μ (center)")
 
+    # Optional: draw predicted span from S_idx/E_idx if available in JSON
+    S_idx = entry.get("S_idx", None)
+    E_idx = entry.get("E_idx", None)
+    if S_idx is not None and E_idx is not None:
+        S_idx = int(S_idx)
+        E_idx = int(E_idx)
+        if one_based:
+            S_span = orig_start + S_idx + 1
+            E_span = orig_start + E_idx + 1
+        else:
+            S_span = orig_start + S_idx
+            E_span = orig_start + E_idx
+        plt.axvspan(S_span, E_span, color="orange", alpha=0.2,
+                    label="Predicted catalytic span (from S/E)")
+
+
     plt.xlabel("Residue position" + (" (1-based)" if one_based else " (0-based)"))
     plt.ylabel("Normalized weight")
     plt.title(f"Attention profile for {chunk_id}\n(L={L}, orig_start={orig_start}, orig_len={orig_len})")

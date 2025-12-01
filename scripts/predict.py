@@ -654,12 +654,24 @@ def main():
                             "L": Li,
                             "orig_start": ostart,
                             "orig_len": olen_i,
+
                             # anchor-based parameters
                             "mu": float(mu[i]),
                             "sigma": float(sigma[i]),
-                            # final-attention-based parameters
+
+                            # final-attention-based parameters (used for S_pred/E_pred)
                             "mu_attn": float(mu_attn[i]),
                             "sigma_attn": float(sigma_attn[i]),
+
+                            # canonical span used downstream (same S/E that go into GFF)
+                            "S_norm": float(S[i]),      # 0–1
+                            "E_norm": float(E[i]),      # 0–1
+                            "S_idx": int(S_idx[i]),     # 0-based index on chunk
+                            "E_idx": int(E_idx[i]),     # 0-based index on chunk
+
+                            # probability for convenience
+                            "P": float(P[i]),
+
                             # per-residue final attention weights and positions
                             "w": wi.tolist(),
                             "abs_pos": abs_pos,
