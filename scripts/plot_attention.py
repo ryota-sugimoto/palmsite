@@ -1,49 +1,52 @@
 #!/usr/bin/env python
 """
-Plot residue-wise final attention weights and the corresponding Gaussian
-(mu_attn, sigma_attn) from a PalmSite attention JSON file.
+Plot full-length final attention weights and Gaussian (from mu_attn, sigma_attn)
+for a base_id, aggregating over all chunks.
 
-Focus: *final attention module only*.
-Anchor-based (mu, sigma from w_anchor) are ignored here and can be
-plotted separately for supplementary figures if needed.
+Aggregation strategy:
+  - For each chunk, we add its attention weights w[pos_local] into a global
+    full_w[pos_abs] (sum over chunks).
+  - Likewise, we add the chunk's Gaussian g_chunk[pos_local] into full_g[pos_abs].
+  - Then we normalize full_w and full_g by their global maxima for plotting.
+
+This emphasizes residues that are consistently attended across overlapping chunks
+(e.g., a true catalytic palm) and downweights isolated spikes from a single chunk.
 
 Expected JSON format (produced by predict.py with --attn-json):
 
 {
-  "chunk_id_1": {
-    "L": 932,
+  "base_chunk_0001_of_0002": {
+    "L": 400,
     "orig_start": 0,
-    "orig_len": 932,
-    "mu": 0.4567,           # anchor (not used here)
-    "sigma": 0.0834,        # anchor (not used here)
-    "mu_attn": 0.4721,      # final attention
-    "sigma_attn": 0.0712,   # final attention
-    "S_norm": 0.40,         # optional, 0–1 (final attention span)
-    "E_norm": 0.65,
-    "S_idx": 377,           # optional, 0-based indices
-    "E_idx": 611,
-    "P": 0.98,
-    "w": [...],             # length L, final attention weights
-    "abs_pos": [...]        # length L, absolute 0-based positions
+    "orig_len": 944,
+    "mu_attn": ...,
+    "sigma_attn": ...,
+    "S_idx": ...,
+    "E_idx": ...,
+    "P": ...,
+    "w": [...],
+    "abs_pos": [...]
   },
+  "base_chunk_0002_of_0002": { ... },
   ...
 }
 
-Usage:
-
-python plot_attention.py \
-    --json nsp12_attention.json \
-    --chunk-id nsp12_chunk_000 \
-    --out figs/nsp12_attention.png \
-    --k-sigma 2.0
-
-If --chunk-id is omitted, the first entry in the JSON is used.
+This script:
+  - Groups entries by base_id (prefix before "_chunk_" if present).
+  - Aggregates over all chunks for that base_id.
+  - Chooses the highest-P chunk to define the predicted catalytic span
+    (same logic as GFF in predict.py).
+  - Plots:
+      X: full-length residue index (0- or 1-based)
+      Y1: aggregated final attention (w), normalized
+      Y2: aggregated Gaussian, normalized
+      Grey band: predicted catalytic span (from best chunk)
 """
 
 import argparse
 import json
 import os
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, List, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -54,17 +57,17 @@ def load_json(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
-def pick_entry(data: Dict[str, Any], chunk_id: str | None) -> Tuple[str, Dict[str, Any]]:
-    if chunk_id is not None:
-        if chunk_id not in data:
-            raise KeyError(
-                f"chunk_id '{chunk_id}' not found in JSON "
-                f"(available keys example: {list(data.keys())[:5]} ...)"
-            )
-        return chunk_id, data[chunk_id]
-    # default: first key
-    first_key = next(iter(data.keys()))
-    return first_key, data[first_key]
+def base_id_from_chunk(cid: str) -> str:
+    """Match predict.py: base_id is prefix before '_chunk_'."""
+    return cid.split("_chunk_")[0] if "_chunk_" in cid else cid
+
+
+def group_by_base_id(data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for cid, entry in data.items():
+        bid = base_id_from_chunk(cid)
+        grouped.setdefault(bid, {})[cid] = entry
+    return grouped
 
 
 def derive_span_from_mu_sigma(
@@ -76,13 +79,9 @@ def derive_span_from_mu_sigma(
         S = clamp(mu_attn - k * sigma_attn, 0, 1)
         E = clamp(mu_attn + k * sigma_attn, 0, 1)
         idx = round(S * (L-1)), round(E * (L-1))   (end-inclusive)
-
-    Returns:
-        (S_idx, E_idx) as 0-based indices in [0, L-1]
     """
     if L <= 1:
         return 0, 0
-
     denom = float(max(L - 1, 1))
     S_norm = max(0.0, min(1.0, mu_attn - k_sigma * sigma_attn))
     E_norm = max(0.0, min(1.0, mu_attn + k_sigma * sigma_attn))
@@ -95,137 +94,183 @@ def derive_span_from_mu_sigma(
     return S_idx, E_idx
 
 
-def plot_attention(
-    chunk_id: str,
-    entry: Dict[str, Any],
+def choose_base_id(grouped: Dict[str, Dict[str, Any]], desired: str | None) -> str:
+    if desired is not None:
+        if desired not in grouped:
+            raise KeyError(
+                f"base_id '{desired}' not found. "
+                f"Available examples: {list(grouped.keys())[:5]} ..."
+            )
+        return desired
+    return next(iter(grouped.keys()))
+
+
+def aggregate_full_length_for_base(
+    base_id: str,
+    chunks: Dict[str, Any],
+    k_sigma: float,
+) -> Tuple[np.ndarray, np.ndarray, int, Tuple[int, int], str]:
+    """
+    Aggregate all chunk entries for this base_id into full-length arrays
+    by summing attention/gaussian across chunks.
+
+    Returns:
+        full_w   : float [orig_len], aggregated final attention (sum over chunks)
+        full_g   : float [orig_len], aggregated Gaussian (sum over chunks)
+        orig_len : int
+        span_abs : (abs_S, abs_E) predicted span (0-based, full-length)
+        best_cid : chunk_id that produced the best span (highest P)
+    """
+    # Determine orig_len as max over chunks
+    orig_len = 0
+    for cid, e in chunks.items():
+        L = int(e["L"])
+        ostart = int(e["orig_start"])
+        olen = int(e.get("orig_len", ostart + L))
+        orig_len = max(orig_len, olen, ostart + L)
+    if orig_len <= 0:
+        raise ValueError(f"Could not determine orig_len for base_id={base_id}")
+
+    full_w = np.zeros(orig_len, dtype=float)
+    full_g = np.zeros(orig_len, dtype=float)
+
+    best_P = -1.0
+    best_span: Tuple[int, int] = (0, 0)
+    best_cid = ""
+
+    for cid, e in chunks.items():
+        L = int(e["L"])
+        ostart = int(e["orig_start"])
+        olen = int(e.get("orig_len", orig_len))
+
+        w = np.asarray(e["w"], dtype=float)
+        if w.shape[0] != L:
+            raise ValueError(f"Chunk {cid}: len(w)={w.shape[0]} != L={L}")
+
+        # final-attention parameters
+        mu_attn = float(e.get("mu_attn", e.get("mu", 0.0)))
+        sigma_attn = float(e.get("sigma_attn", e.get("sigma", 0.0)))
+
+        # --- Aggregate attention: sum over chunks ---
+        for idx_local in range(L):
+            pos_abs = ostart + idx_local
+            if 0 <= pos_abs < orig_len:
+                full_w[pos_abs] += w[idx_local]
+
+        # --- Gaussian for this chunk (normalized per chunk, then summed) ---
+        if L > 1:
+            idx_local_arr = np.arange(L, dtype=float)
+            denom = float(max(L - 1, 1))
+            pos_norm = idx_local_arr / denom
+            g_chunk = np.exp(-0.5 * ((pos_norm - mu_attn) / max(sigma_attn, 1e-8)) ** 2)
+            gmax = float(g_chunk.max()) if g_chunk.size > 0 else 1.0
+            if gmax > 0.0:
+                g_chunk = g_chunk / gmax
+        else:
+            g_chunk = np.zeros((L,), dtype=float)
+
+        for idx_local in range(L):
+            pos_abs = ostart + idx_local
+            if 0 <= pos_abs < orig_len:
+                full_g[pos_abs] += g_chunk[idx_local]
+
+        # --- Span / P for best-chunk selection (GFF-style) ---
+        P = float(e.get("P", 0.0))
+
+        if "S_idx" in e and "E_idx" in e:
+            S_idx = int(e["S_idx"])
+            E_idx = int(e["E_idx"])
+            S_idx = max(0, min(S_idx, L - 1))
+            E_idx = max(0, min(E_idx, L - 1))
+            if E_idx < S_idx:
+                S_idx, E_idx = E_idx, S_idx
+        else:
+            S_idx, E_idx = derive_span_from_mu_sigma(mu_attn, sigma_attn, L, k_sigma)
+
+        abs_S = ostart + S_idx
+        abs_E = ostart + E_idx
+        abs_S = max(0, min(abs_S, orig_len - 1))
+        abs_E = max(0, min(abs_E, orig_len - 1))
+        if abs_E < abs_S:
+            abs_S, abs_E = abs_E, abs_S
+
+        if P > best_P:
+            best_P = P
+            best_span = (abs_S, abs_E)
+            best_cid = cid
+
+    return full_w, full_g, orig_len, best_span, best_cid
+
+
+def plot_full_attention(
+    base_id: str,
+    full_w: np.ndarray,
+    full_g: np.ndarray,
+    orig_len: int,
+    span_abs: Tuple[int, int],
+    best_cid: str,
     out_path: str,
-    k_sigma: float = 2.0,
     one_based: bool = True,
 ) -> None:
-    """
-    Make an X-Y plot using *final attention* information only:
+    """Plot full-length attention/Gaussian for a base_id."""
 
-      X: absolute residue index (0- or 1-based)
-      Y1: normalized attention weights w (final attention)
-      Y2: normalized Gaussian from (mu_attn, sigma_attn)
+    if orig_len <= 0:
+        raise ValueError("orig_len must be > 0")
 
-    Additionally:
-      - Shaded grey band = predicted catalytic span from S_idx/E_idx
-        (same span that goes into GFF).
-    """
+    x = np.arange(orig_len, dtype=float)
+    x_plot = x + 1.0 if one_based else x
 
-    L = int(entry["L"])
-    orig_start = int(entry["orig_start"])
-    orig_len = int(entry["orig_len"])
-
-    # final-attention parameters (fallback to anchor if mu_attn/sigma_attn missing)
-    mu_attn = float(entry.get("mu_attn", entry.get("mu", 0.0)))
-    sigma_attn = float(entry.get("sigma_attn", entry.get("sigma", 0.0)))
-
-    w = np.asarray(entry["w"], dtype=float)
-    abs_pos = np.asarray(entry["abs_pos"], dtype=int)
-
-    if len(w) != L or len(abs_pos) != L:
-        raise ValueError(
-            f"Inconsistent L ({L}) vs len(w)={len(w)} vs len(abs_pos)={len(abs_pos)}"
-        )
-
-    if L <= 1:
-        raise ValueError("Sequence length L <= 1, cannot plot meaningful curve.")
-
-    # X-axis: actual residue positions
-    x = abs_pos + (1 if one_based else 0)
-
-    # Normalize attention weights to [0,1] by max (for shape comparison)
+    # Normalize attention and Gaussian
+    w = full_w.copy()
+    g = full_g.copy()
     w_max = float(w.max()) if w.size > 0 else 1.0
-    if w_max <= 0.0:
-        w_norm = np.zeros_like(w)
-    else:
-        w_norm = w / w_max
-
-    # Reconstruct Gaussian over discrete positions from (mu_attn, sigma_attn)
-    idx = np.arange(L, dtype=float)
-    denom = float(max(L - 1, 1))
-    pos_norm = idx / denom
-    g = np.exp(-0.5 * ((pos_norm - mu_attn) / max(sigma_attn, 1e-8)) ** 2)
     g_max = float(g.max()) if g.size > 0 else 1.0
-    if g_max <= 0.0:
-        g_norm = np.zeros_like(g)
-    else:
-        g_norm = g / g_max
+    if w_max > 0.0:
+        w /= w_max
+    if g_max > 0.0:
+        g /= g_max
 
-    # Predicted span indices: prefer S_idx/E_idx from JSON, otherwise derive them
-    if "S_idx" in entry and "E_idx" in entry:
-        S_idx = int(entry["S_idx"])
-        E_idx = int(entry["E_idx"])
-        S_idx = max(0, min(S_idx, L - 1))
-        E_idx = max(0, min(E_idx, L - 1))
-        if E_idx < S_idx:
-            S_idx, E_idx = E_idx, S_idx
-    else:
-        S_idx, E_idx = derive_span_from_mu_sigma(mu_attn, sigma_attn, L, k_sigma)
-
-    # Convert span indices to plotting coordinates (absolute positions)
+    S_abs, E_abs = span_abs
     if one_based:
-        S_plot = orig_start + S_idx + 1
-        E_plot = orig_start + E_idx + 1
+        S_plot = S_abs + 1
+        E_plot = E_abs + 1
     else:
-        S_plot = orig_start + S_idx
-        E_plot = orig_start + E_idx
+        S_plot = S_abs
+        E_plot = E_abs
 
-    # Prepare figure
-    plt.figure(figsize=(8, 4))
+    plt.figure(figsize=(10, 4))
 
-    # Plot attention weights
     plt.plot(
-        x,
-        w_norm,
-        label="Final attention (w, normalized)",
+        x_plot,
+        w,
+        label="Final attention (aggregated, normalized)",
         linewidth=1.5,
         color="tab:blue",
     )
 
-    # Plot Gaussian shape (from final attention)
     plt.plot(
-        x,
-        g_norm,
+        x_plot,
+        g,
         linestyle="--",
-        label="Gaussian from (μ_attn, σ_attn), normalized",
+        label="Gaussian (aggregated, normalized)",
         linewidth=1.5,
         color="tab:orange",
     )
 
-    # Shade predicted span (S_idx..E_idx)
     plt.axvspan(
         S_plot,
         E_plot,
         color="grey",
         alpha=0.15,
-        label="Predicted catalytic span (final attention)",
+        label=f"Predicted catalytic span (best chunk: {best_cid})",
     )
 
-    # Mark μ_attn as a vertical line
-    mu_idx = mu_attn * denom
-    mu_abs = orig_start + mu_idx
-    if one_based:
-        mu_plot = mu_abs + 1.0
-    else:
-        mu_plot = mu_abs
-    plt.axvline(
-        mu_plot,
-        color="black",
-        linestyle=":",
-        linewidth=1.0,
-        label="μ_attn (center)",
-    )
-
-    # Labels and formatting
     x_label = "Residue position (1-based)" if one_based else "Residue position (0-based)"
     plt.xlabel(x_label)
     plt.ylabel("Normalized weight")
     plt.title(
-        f"Attention profile for {chunk_id}\n"
-        f"(L={L}, orig_start={orig_start}, orig_len={orig_len})"
+        f"Full-length attention for {base_id}\n"
+        f"(orig_len={orig_len}, best_chunk={best_cid})"
     )
     plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
     plt.legend(fontsize=8, loc="upper right")
@@ -235,12 +280,12 @@ def plot_attention(
     plt.savefig(out_path, dpi=300)
     plt.close()
 
-    print(f"[plot] Saved plot for chunk_id='{chunk_id}' to: {out_path}")
+    print(f"[plot] Saved full-length attention plot for base_id='{base_id}' to: {out_path}")
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Plot residue-wise final attention and Gaussian from PalmSite attention JSON."
+        description="Plot full-length final attention and Gaussian from PalmSite attention JSON."
     )
     p.add_argument(
         "--json",
@@ -248,20 +293,26 @@ def parse_args() -> argparse.Namespace:
         help="JSON file produced by predict.py with --attn-json.",
     )
     p.add_argument(
-        "--chunk-id",
+        "--base-id",
         default=None,
-        help="Chunk ID to plot. If omitted, the first entry in the JSON is used.",
+        help=(
+            "Base sequence ID to plot. If omitted, the base_id of the first JSON entry is used. "
+            "base_id is defined as the prefix before '_chunk_' in chunk_id."
+        ),
     )
     p.add_argument(
         "--out",
         required=True,
-        help="Output image path (e.g. figs/nsp12_attention.png).",
+        help="Output image path (e.g. figs/attention_full.png).",
     )
     p.add_argument(
         "--k-sigma",
         type=float,
         default=2.0,
-        help="Number of sigmas used for the span when S_idx/E_idx are not present (default: 2.0).",
+        help=(
+            "Number of sigmas used when deriving span from mu_attn/sigma_attn if "
+            "S_idx/E_idx are not available (default: 2.0)."
+        ),
     )
     p.add_argument(
         "--zero-based",
@@ -274,12 +325,24 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     data = load_json(args.json)
-    chunk_id, entry = pick_entry(data, args.chunk_id)
-    plot_attention(
-        chunk_id=chunk_id,
-        entry=entry,
-        out_path=args.out,
+    grouped = group_by_base_id(data)
+    base_id = choose_base_id(grouped, args.base_id)
+    chunks = grouped[base_id]
+
+    full_w, full_g, orig_len, span_abs, best_cid = aggregate_full_length_for_base(
+        base_id=base_id,
+        chunks=chunks,
         k_sigma=float(args.k_sigma),
+    )
+
+    plot_full_attention(
+        base_id=base_id,
+        full_w=full_w,
+        full_g=full_g,
+        orig_len=orig_len,
+        span_abs=span_abs,
+        best_cid=best_cid,
+        out_path=args.out,
         one_based=not args.zero_based,
     )
 
