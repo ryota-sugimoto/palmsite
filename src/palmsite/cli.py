@@ -7,33 +7,78 @@ from .embed_shim import embed_fastas_to_h5
 from .infer_simple import predict_to_gff
 from . import __version__
 
-@click.command(context_settings=dict(help_option_names=["-h","--help"]))
+
+@click.command(context_settings=dict(help_option_names=["-h", "--help"]))
 @click.version_option(__version__, prog_name="palmsite")
-@click.option("-o","--gff-out", default=None,
-              help="Write GFF3 to this path; default: stdout if omitted")
-@click.option("-p","--min-p", type=float, default=0.50, show_default=True,
-              help="Minimum probability to include a feature in GFF")
-@click.option("-b","--backbone", type=click.Choice(["300m","600m","6b"]), default="600m", show_default=True,
-              help=("Embedding backbone & size: "
-                    "'300m' (fast, local), '600m' (balanced, local), '6b' (highest quality via ESM Forge; "
-                    "requires --token or ESM_FORGE_TOKEN)."))
-@click.option("-m","--model-id", default=None,
-              help="Hugging Face model repo (default via PALMSITE_MODEL_ID env or palmsite/<backbone>)")
-@click.option("-r","--revision", default=None, hidden=True,
-              help="(Deprecated) HF tag or commit (e.g., v1). Prefer defaults or PALMSITE_MODEL_REV.")
-@click.option("-d","--device", type=click.Choice(["auto","cpu","cuda"]), default="auto", show_default=True,
-              help="Device for local ESM-C (ignored for 6B Forge)")
-@click.option("-k","--token", default=None,
-              help="Forge token (required for 6B if not set in ESM_FORGE_TOKEN)")
-@click.option("-t","--tmp-dir", default=None, help="Optional working directory for temp files")
-@click.option("-q","--quiet", is_flag=True, help="Reduce non-error logs")
-@click.option("-v","--verbose", is_flag=True, help="Verbose logs (DEBUG level; overrides -q)")
-@click.option("--keep-tmp", is_flag=True, help="Keep temporary files (sanitized FASTA & embeddings.h5) for debugging")
+@click.option(
+    "-o", "--gff-out", default=None,
+    help="Write GFF3 to this path; default: stdout if omitted",
+)
+@click.option(
+    "-p", "--min-p", type=float, default=0.50, show_default=True,
+    help="Minimum probability to include a feature in GFF",
+)
+@click.option(
+    "-b", "--backbone",
+    type=click.Choice(["300m", "600m", "6b"]),
+    default="600m", show_default=True,
+    help=(
+        "Embedding backbone & size: "
+        "'300m' (fast, local), '600m' (balanced, local), '6b' (highest quality via ESM Forge; "
+        "requires --token or ESM_FORGE_TOKEN)."
+    ),
+)
+@click.option(
+    "-m", "--model-id", default=None,
+    help="Hugging Face model repo (default via PALMSITE_MODEL_ID env or palmsite/<backbone>)",
+)
+@click.option(
+    "-r", "--revision", default=None, hidden=True,
+    help="(Deprecated) HF tag or commit (e.g., v1). Prefer defaults or PALMSITE_MODEL_REV.",
+)
+@click.option(
+    "-d", "--device",
+    type=click.Choice(["auto", "cpu", "cuda"]),
+    default="auto", show_default=True,
+    help="Device for local ESM-C (ignored for 6B Forge)",
+)
+@click.option(
+    "-k", "--token", default=None,
+    help="Forge token (required for 6B if not set in ESM_FORGE_TOKEN)",
+)
+@click.option(
+    "-t", "--tmp-dir", default=None,
+    help="Optional working directory for temp files",
+)
+@click.option("-q", "--quiet", is_flag=True, help="Reduce non-error logs")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose logs (DEBUG level; overrides -q)")
+@click.option(
+    "--keep-tmp", is_flag=True,
+    help="Keep temporary files (sanitized FASTA & embeddings.h5) for debugging",
+)
+@click.option(
+    "--attn-json", default=None,
+    help="Optional path to write per-chunk residue-wise attention details as JSON.",
+)
 @click.argument("fastas", nargs=-1, type=click.Path(exists=True))
-def main(gff_out, min_p, backbone, model_id, revision, device, token, tmp_dir, quiet, verbose, keep_tmp, fastas):
+def main(
+    gff_out,
+    min_p,
+    backbone,
+    model_id,
+    revision,
+    device,
+    token,
+    tmp_dir,
+    quiet,
+    verbose,
+    keep_tmp,
+    attn_json,
+    fastas,
+):
     """
     PalmSite — RdRP catalytic center predictor.
-    Usage: palmsite -p 0.5 [-o result.gff] [options] <fasta ...>
+    Usage: palmsite -p 0.5 [-o result.gff] [--attn-json details.json] [options] <fasta ...>
     """
     if not fastas:
         click.echo("No FASTA provided. See `palmsite --help`.", err=True)
@@ -64,7 +109,10 @@ def main(gff_out, min_p, backbone, model_id, revision, device, token, tmp_dir, q
             click.echo("All sequences were invalid after sanitization; aborting.", err=True)
             sys.exit(2)
         if not quiet:
-            click.echo(f"Sanitized sequences: kept={n_ok}, fixed={n_fixed}, dropped={n_dropped}", err=True)
+            click.echo(
+                f"Sanitized sequences: kept={n_ok}, fixed={n_fixed}, dropped={n_dropped}",
+                err=True,
+            )
     except Exception as e:
         click.echo(f"Sanitization failed: {e}", err=True)
         sys.exit(2)
@@ -87,7 +135,7 @@ def main(gff_out, min_p, backbone, model_id, revision, device, token, tmp_dir, q
         click.echo(f"Embedding failed: {e}", err=True)
         sys.exit(2)
 
-    # 3) Infer → 4) GFF
+    # 3) Infer → 4) GFF (+ optional JSON)
     out_fp = None
     try:
         if not quiet:
@@ -105,6 +153,7 @@ def main(gff_out, min_p, backbone, model_id, revision, device, token, tmp_dir, q
             revision=revision,
             min_p=float(min_p),
             out_stream=stream,
+            attn_json=attn_json,
         )
     except Exception as e:
         click.echo(f"Inference failed: {e}", err=True)
@@ -115,3 +164,4 @@ def main(gff_out, min_p, backbone, model_id, revision, device, token, tmp_dir, q
         if not tmp_dir and not keep_tmp:
             # cleanup our own temp dir unless user asked to keep it
             shutil.rmtree(tmp_base, ignore_errors=True)
+

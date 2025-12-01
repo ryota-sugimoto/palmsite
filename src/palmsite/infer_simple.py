@@ -1,8 +1,7 @@
 from __future__ import annotations
-import os, sys, csv, h5py, numpy as np
-from typing import Dict, Tuple, IO
+import os, sys, csv, h5py, numpy as np, json
+from typing import Dict, Tuple, IO, Any, Optional
 from .hf import fetch_weights
-
 
 
 def _strip_prefixes(sd, prefixes=('_orig_mod.', 'module.')):
@@ -15,6 +14,7 @@ def _strip_prefixes(sd, prefixes=('_orig_mod.', 'module.')):
         out[kk] = v
     return out
 
+
 def _base_id(cid: str) -> str:
     # handle both patterns from your pipelines
     if "|chunk_" in cid:   # produced by your embedding script
@@ -23,18 +23,29 @@ def _base_id(cid: str) -> str:
         return cid.split("_chunk_")[0]
     return cid
 
+
 def _d_model_from_h5(emb_h5: str) -> int:
     with h5py.File(emb_h5, "r") as h5:
         any_id = next(iter(h5["items"].keys()))
         g = h5[f"items/{any_id}"]
         return int(g.attrs.get("d_model", g["emb"].shape[1]))
 
-def predict_to_gff(embeddings_h5: str,
-                   backbone: str,
-                   model_id: str | None,
-                   revision: str | None,
-                   min_p: float,
-                   out_stream: IO[str]) -> None:
+
+def predict_to_gff(
+    embeddings_h5: str,
+    backbone: str,
+    model_id: str | None,
+    revision: str | None,
+    min_p: float,
+    out_stream: IO[str],
+    attn_json: str | None = None,
+) -> None:
+    """
+    Run PalmSite on an embeddings.h5 file and write GFF3 to out_stream.
+
+    If attn_json is not None, also write a JSON file with per-chunk
+    residue-wise attention details (same schema as predict.py/_predict_impl).
+    """
     try:
         import torch
         from torch.utils.data import DataLoader
@@ -47,6 +58,7 @@ def predict_to_gff(embeddings_h5: str,
             "PalmSite prediction requires PyTorch. "
             "Install with: pip install 'palmsite[cpu]' (or use conda 'pytorch')."
         ) from e
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_path = fetch_weights(backbone, model_id, revision)
 
@@ -91,6 +103,9 @@ def predict_to_gff(embeddings_h5: str,
     # Aggregate best per original sequence
     best: Dict[str, Tuple[float, str, int, int, int, float, int]] = {}
 
+    # Optional per-chunk residue-wise attention JSON
+    attn_obj: Optional[Dict[str, Any]] = {} if attn_json is not None else None
+
     out_stream.write("##gff-version 3\n")
     with torch.no_grad():
         for b in dl:
@@ -98,14 +113,20 @@ def predict_to_gff(embeddings_h5: str,
             m = b["mask"].to(device)
             L = b["L"].to(device)
             o = model(x, m, L)
+
             P = torch.sigmoid(o["logit"] / T).cpu().numpy()
             S = o["S_pred"].cpu().numpy()
             E = o["E_pred"].cpu().numpy()
             mu = o["mu"].cpu().numpy()
+            sigma = o["sigma"].cpu().numpy()
+            mu_attn = o["mu_attn"].cpu().numpy()
+            sigma_attn = o["sigma_attn"].cpu().numpy()
+            w_full = o["w"].cpu().numpy()
+
             Lnp = b["L"].cpu().numpy().astype(int)
             S_idx = np.round(S * (Lnp - 1)).astype(int)
             E_idx = np.round(E * (Lnp - 1)).astype(int)
-            mu_idx= np.round(mu * (Lnp - 1)).astype(int)
+            mu_idx = np.round(mu * (Lnp - 1)).astype(int)
             orig_start = b["orig_start"].cpu().numpy().astype(int)
             orig_len   = b["orig_len"].cpu().numpy().astype(int)
 
@@ -113,12 +134,52 @@ def predict_to_gff(embeddings_h5: str,
                 # Absolute coords on original protein (1-based in GFF)
                 aS = int(orig_start[i] + S_idx[i]) + 1
                 aE = int(orig_start[i] + E_idx[i]) + 1
-                if aE < aS: aS, aE = aE, aS
+                if aE < aS:
+                    aS, aE = aE, aS
                 bid = _base_id(cid)
                 pi = float(P[i])
+
                 if (bid not in best) or (pi > best[bid][0]):
-                    best[bid] = (pi, cid, aS, aE, int(orig_start[i] + mu_idx[i]) + 1,
-                                 float(o["sigma"].cpu().numpy()[i]), int(orig_len[i]))
+                    best[bid] = (
+                        pi,
+                        cid,
+                        aS,
+                        aE,
+                        int(orig_start[i] + mu_idx[i]) + 1,
+                        float(sigma[i]),
+                        int(orig_len[i]),
+                    )
+
+                # Optional per-chunk attention JSON (same schema as predict.py/_predict_impl)
+                if attn_obj is not None:
+                    Li = int(Lnp[i])
+                    if Li > 0:
+                        wi = w_full[i, :Li].astype(float, copy=False)
+                        ostart = int(orig_start[i])
+                        olen_i = int(orig_len[i])
+                        abs_pos = (ostart + np.arange(Li, dtype=int)).tolist()
+
+                        attn_obj[cid] = {
+                            "L": Li,
+                            "orig_start": ostart,
+                            "orig_len": olen_i,
+                            # anchor-based parameters
+                            "mu": float(mu[i]),
+                            "sigma": float(sigma[i]),
+                            # final-attention-based parameters
+                            "mu_attn": float(mu_attn[i]),
+                            "sigma_attn": float(sigma_attn[i]),
+                            # span info (normalized + indices)
+                            "S_norm": float(S[i]),
+                            "E_norm": float(E[i]),
+                            "S_idx": int(S_idx[i]),
+                            "E_idx": int(E_idx[i]),
+                            # probability
+                            "P": float(P[i]),
+                            # per-residue attention + absolute positions
+                            "w": wi.tolist(),
+                            "abs_pos": abs_pos,
+                        }
 
     # Emit GFF rows with min-p filter
     n = 0
@@ -136,5 +197,12 @@ def predict_to_gff(embeddings_h5: str,
         row = [bid, "PalmSite", "RdRP_domain", str(aS), str(aE), f"{Pmax:.6f}", ".", ".", ";".join(attrs)]
         out_stream.write("\t".join(row) + "\n")
         n += 1
+
     if out_stream is not sys.stdout:
         out_stream.flush()
+
+    # Write attention JSON if requested
+    if attn_obj is not None and attn_json is not None:
+        os.makedirs(os.path.dirname(attn_json) or ".", exist_ok=True)
+        with open(attn_json, "w", encoding="utf-8") as fjson:
+            json.dump(attn_obj, fjson, indent=2)
