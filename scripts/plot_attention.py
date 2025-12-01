@@ -4,14 +4,17 @@ Plot full-length final attention weights and Gaussian (from mu_attn, sigma_attn)
 for a base_id, aggregating over all chunks.
 
 Aggregation strategy:
-  - For each chunk, we add its attention weights w[pos_local] into a global
-    full_w[pos_abs] (sum over chunks).
-  - Likewise, we add the chunk's Gaussian g_chunk[pos_local] into full_g[pos_abs].
-  - Then we (optionally) smooth full_w/full_g with a moving average and
-    normalize them by their global maxima for plotting.
+  - Attention (w): for each chunk, we add its attention weights w[pos_local]
+    into a global full_w[pos_abs] (sum over chunks).
+  - Gaussian (g): we compute the Gaussian only for the BEST chunk (highest P)
+    and place it into full_g[pos_abs] for that chunk's residues.
+  - Then we optionally smooth full_w/full_g and normalize them by their
+    total sum. For visualization, we rescale the Gaussian so its maximum
+    matches the maximum of the attention curve, so it is clearly visible.
 
 This emphasizes residues that are consistently attended across overlapping chunks
-(e.g., a true catalytic palm) and downweights isolated spikes from a single chunk.
+(e.g., a true catalytic palm), while showing the Gaussian only for the “winner”
+chunk that actually defines the predicted span (matching GFF behavior).
 
 Expected JSON format (produced by predict.py with --attn-json):
 
@@ -31,17 +34,6 @@ Expected JSON format (produced by predict.py with --attn-json):
   "base_chunk_0002_of_0002": { ... },
   ...
 }
-
-This script:
-  - Groups entries by base_id (prefix before "_chunk_" if present).
-  - Aggregates over all chunks for that base_id.
-  - Chooses the highest-P chunk to define the predicted catalytic span
-    (same logic as GFF in predict.py).
-  - Plots:
-      X: full-length residue index (0- or 1-based)
-      Y1: aggregated final attention (w), normalized
-      Y2: aggregated Gaussian, normalized
-      Grey band: predicted catalytic span (from best chunk)
 """
 
 import argparse
@@ -112,12 +104,17 @@ def aggregate_full_length_for_base(
     k_sigma: float,
 ) -> Tuple[np.ndarray, np.ndarray, int, Tuple[int, int], str]:
     """
-    Aggregate all chunk entries for this base_id into full-length arrays
-    by summing attention/gaussian across chunks.
+    Aggregate all chunk entries for this base_id into full-length arrays.
+
+    Behavior:
+      - full_w: sum of attention weights over all chunks.
+      - full_g: Gaussian only from the best chunk (highest P).
+      - span_abs: span (abs_S, abs_E) from the best chunk, 0-based.
+      - best_cid: the winner chunk.
 
     Returns:
-        full_w   : float [orig_len], aggregated final attention (sum over chunks)
-        full_g   : float [orig_len], aggregated Gaussian (sum over chunks)
+        full_w   : float [orig_len]
+        full_g   : float [orig_len]
         orig_len : int
         span_abs : (abs_S, abs_E) predicted span (0-based, full-length)
         best_cid : chunk_id that produced the best span (highest P)
@@ -133,8 +130,9 @@ def aggregate_full_length_for_base(
         raise ValueError(f"Could not determine orig_len for base_id={base_id}")
 
     full_w = np.zeros(orig_len, dtype=float)
-    full_g = np.zeros(orig_len, dtype=float)
+    full_g = np.zeros(orig_len, dtype=float)  # will be filled only for best chunk
 
+    # First pass: aggregate w across all chunks and find best chunk (by P)
     best_P = -1.0
     best_span: Tuple[int, int] = (0, 0)
     best_cid = ""
@@ -148,36 +146,15 @@ def aggregate_full_length_for_base(
         if w.shape[0] != L:
             raise ValueError(f"Chunk {cid}: len(w)={w.shape[0]} != L={L}")
 
-        # final-attention parameters
-        mu_attn = float(e.get("mu_attn", e.get("mu", 0.0)))
-        sigma_attn = float(e.get("sigma_attn", e.get("sigma", 0.0)))
-
-        # --- Aggregate attention: sum over chunks ---
+        # Aggregate attention: sum over chunks
         for idx_local in range(L):
             pos_abs = ostart + idx_local
             if 0 <= pos_abs < orig_len:
                 full_w[pos_abs] += w[idx_local]
 
-        # --- Gaussian for this chunk (normalized per chunk, then summed) ---
-        if L > 1:
-            idx_local_arr = np.arange(L, dtype=float)
-            denom = float(max(L - 1, 1))
-            pos_norm = idx_local_arr / denom
-            g_chunk = np.exp(
-                -0.5 * ((pos_norm - mu_attn) / max(sigma_attn, 1e-8)) ** 2
-            )
-            gmax = float(g_chunk.max()) if g_chunk.size > 0 else 1.0
-            if gmax > 0.0:
-                g_chunk = g_chunk / gmax
-        else:
-            g_chunk = np.zeros((L,), dtype=float)
-
-        for idx_local in range(L):
-            pos_abs = ostart + idx_local
-            if 0 <= pos_abs < orig_len:
-                full_g[pos_abs] += g_chunk[idx_local]
-
-        # --- Span / P for best-chunk selection (GFF-style) ---
+        # Span / P for best-chunk selection
+        mu_attn = float(e.get("mu_attn", e.get("mu", 0.0)))
+        sigma_attn = float(e.get("sigma_attn", e.get("sigma", 0.0)))
         P = float(e.get("P", 0.0))
 
         if "S_idx" in e and "E_idx" in e:
@@ -201,6 +178,29 @@ def aggregate_full_length_for_base(
             best_P = P
             best_span = (abs_S, abs_E)
             best_cid = cid
+
+    # Second pass: compute Gaussian only for best chunk
+    if best_cid:
+        e = chunks[best_cid]
+        L = int(e["L"])
+        ostart = int(e["orig_start"])
+        mu_attn = float(e.get("mu_attn", e.get("mu", 0.0)))
+        sigma_attn = float(e.get("sigma_attn", e.get("sigma", 0.0)))
+
+        if L > 1:
+            idx_local_arr = np.arange(L, dtype=float)
+            denom = float(max(L - 1, 1))
+            pos_norm = idx_local_arr / denom
+            g_chunk = np.exp(
+                -0.5 * ((pos_norm - mu_attn) / max(sigma_attn, 1e-8)) ** 2
+            )
+        else:
+            g_chunk = np.zeros((L,), dtype=float)
+
+        for idx_local in range(L):
+            pos_abs = ostart + idx_local
+            if 0 <= pos_abs < orig_len:
+                full_g[pos_abs] = g_chunk[idx_local]
 
     return full_w, full_g, orig_len, best_span, best_cid
 
@@ -247,13 +247,19 @@ def plot_full_attention(
     w = smooth_1d(full_w.copy(), smooth_window)
     g = smooth_1d(full_g.copy(), smooth_window)
 
-    # Normalize attention and Gaussian
+    # Normalize by total mass (each curve integrates to 1 before visual scaling)
+    w_sum = float(w.sum()) if w.size > 0 else 1.0
+    g_sum = float(g.sum()) if g.size > 0 else 1.0
+    if w_sum > 0.0:
+        w /= w_sum
+    if g_sum > 0.0:
+        g /= g_sum
+
+    # For visualization, rescale Gaussian so its max matches attention's max
     w_max = float(w.max()) if w.size > 0 else 1.0
     g_max = float(g.max()) if g.size > 0 else 1.0
-    if w_max > 0.0:
-        w /= w_max
-    if g_max > 0.0:
-        g /= g_max
+    if g_max > 0 and w_max > 0:
+        g *= (w_max / g_max)
 
     S_abs, E_abs = span_abs
     if one_based:
@@ -268,7 +274,7 @@ def plot_full_attention(
     plt.plot(
         x_plot,
         w,
-        label="Final attention (aggregated, normalized)",
+        label="Final attention (aggregated, mass-normalized)",
         linewidth=1.5,
         color="tab:blue",
     )
@@ -277,7 +283,7 @@ def plot_full_attention(
         x_plot,
         g,
         linestyle="--",
-        label="Gaussian (aggregated, normalized)",
+        label="Gaussian (best chunk; mass-normalized, rescaled)",
         linewidth=1.5,
         color="tab:orange",
     )
