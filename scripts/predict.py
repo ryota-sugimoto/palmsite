@@ -624,15 +624,22 @@ def main():
                 else:
                     S = out['S_pred'].detach().cpu().numpy()
                     E = out['E_pred'].detach().cpu().numpy()
+
+                # anchor-based mu, sigma
                 mu = out['mu'].detach().cpu().numpy()
                 sigma = out['sigma'].detach().cpu().numpy()
+
+                # final-attention-based mu_attn, sigma_attn
+                mu_attn = out['mu_attn'].detach().cpu().numpy()
+                sigma_attn = out['sigma_attn'].detach().cpu().numpy()
+
                 Lcpu = batch['L'].cpu().numpy().astype(int)
                 orig_start = batch['orig_start'].cpu().numpy().astype(int)
                 orig_len = batch['orig_len'].cpu().numpy().astype(int)
                 # final attention over valid tokens
                 w_full = out['w'].detach().cpu().numpy()  # (B, T)
 
-                # --- NEW: per-residue attention JSON storage ---
+                # --- per-residue attention JSON storage ---
                 if attn_json is not None:
                     for i, cid in enumerate(batch['chunk_ids']):
                         Li = int(Lcpu[i])
@@ -642,12 +649,18 @@ def main():
                         ostart = int(orig_start[i])
                         olen_i = int(orig_len[i])
                         abs_pos = (ostart + np.arange(Li, dtype=int)).tolist()
+
                         attn_json[cid] = {
                             "L": Li,
                             "orig_start": ostart,
                             "orig_len": olen_i,
+                            # anchor-based parameters
                             "mu": float(mu[i]),
                             "sigma": float(sigma[i]),
+                            # final-attention-based parameters
+                            "mu_attn": float(mu_attn[i]),
+                            "sigma_attn": float(sigma_attn[i]),
+                            # per-residue final attention weights and positions
                             "w": wi.tolist(),
                             "abs_pos": abs_pos,
                         }

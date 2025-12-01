@@ -76,8 +76,8 @@ def plot_attention(
     L = int(entry["L"])
     orig_start = int(entry["orig_start"])
     orig_len = int(entry["orig_len"])
-    mu = float(entry["mu"])       # in [0,1]
-    sigma = float(entry["sigma"]) # in [0,0.5]
+    mu = float(entry.get("mu_attn", entry["mu"]))
+    sigma = float(entry.get("sigma_attn", entry["sigma"]))
     w = np.asarray(entry["w"], dtype=float)
     abs_pos = np.asarray(entry["abs_pos"], dtype=int)
 
