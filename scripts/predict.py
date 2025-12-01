@@ -619,8 +619,11 @@ def main():
                     logits = out['logit'] / float(T)
                     P = torch.sigmoid(logits)
                 P = P.detach().cpu().numpy()
+
                 if args.discovery:
-                    S, E, ent = _attn_hpd_span_from_out(out, mask, L, mass=float(args.attn_mass), pos_channel=pos_channel)
+                    S, E, ent = _attn_hpd_span_from_out(
+                        out, mask, L, mass=float(args.attn_mass), pos_channel=pos_channel
+                    )
                 else:
                     S = out['S_pred'].detach().cpu().numpy()
                     E = out['E_pred'].detach().cpu().numpy()
@@ -636,8 +639,14 @@ def main():
                 Lcpu = batch['L'].cpu().numpy().astype(int)
                 orig_start = batch['orig_start'].cpu().numpy().astype(int)
                 orig_len = batch['orig_len'].cpu().numpy().astype(int)
+
                 # final attention over valid tokens
                 w_full = out['w'].detach().cpu().numpy()  # (B, T)
+
+                # indices under end-inclusive mapping (same as GFF)
+                S_idx = np.round(S * (Lcpu - 1)).astype(int)
+                E_idx = np.round(E * (Lcpu - 1)).astype(int)
+                mu_idx = np.round(mu * (Lcpu - 1)).astype(int)
 
                 # --- per-residue attention JSON storage ---
                 if attn_json is not None:
@@ -659,15 +668,15 @@ def main():
                             "mu": float(mu[i]),
                             "sigma": float(sigma[i]),
 
-                            # final-attention-based parameters (used for S_pred/E_pred)
+                            # final-attention-based parameters
                             "mu_attn": float(mu_attn[i]),
                             "sigma_attn": float(sigma_attn[i]),
 
-                            # canonical span used downstream (same S/E that go into GFF)
-                            "S_norm": float(S[i]),      # 0–1
-                            "E_norm": float(E[i]),      # 0–1
-                            "S_idx": int(S_idx[i]),     # 0-based index on chunk
-                            "E_idx": int(E_idx[i]),     # 0-based index on chunk
+                            # canonical span (exactly what GFF uses)
+                            "S_norm": float(S[i]),
+                            "E_norm": float(E[i]),
+                            "S_idx": int(S_idx[i]),
+                            "E_idx": int(E_idx[i]),
 
                             # probability for convenience
                             "P": float(P[i]),
@@ -677,46 +686,63 @@ def main():
                             "abs_pos": abs_pos,
                         }
 
-                # indices under end-inclusive mapping
-                S_idx = np.round(S * (Lcpu - 1)).astype(int)
-                E_idx = np.round(E * (Lcpu - 1)).astype(int)
-                mu_idx = np.round(mu * (Lcpu - 1)).astype(int)
                 # absolute mapping to original sequence
                 abs_S = orig_start + S_idx
                 abs_E = orig_start + E_idx
+
                 # ---- emit per-chunk predictions + optional HDF5 export ----
                 for i, cid in enumerate(batch['chunk_ids']):
                     # CSV row
-                    writer.writerow([cid, float(P[i]), float(S[i]), float(E[i]), int(S_idx[i]), int(E_idx[i]), float(mu[i]), int(mu_idx[i]), float(sigma[i]), int(Lcpu[i])])
+                    writer.writerow([
+                        cid,
+                        float(P[i]),
+                        float(S[i]),
+                        float(E[i]),
+                        int(S_idx[i]),
+                        int(E_idx[i]),
+                        float(mu[i]),
+                        int(mu_idx[i]),
+                        float(sigma[i]),
+                        int(Lcpu[i]),
+                    ])
+
                     # aggregate best per base id
                     bid = base_id_from_chunk(cid)
-                    cand = (float(P[i]), cid, int(abs_S[i]), int(abs_E[i]), int(orig_start[i] + mu_idx[i]), float(sigma[i]), int(orig_len[i]), float(S[i]), float(E[i]), 0.0)
+                    cand = (
+                        float(P[i]),
+                        cid,
+                        int(abs_S[i]),
+                        int(abs_E[i]),
+                        int(orig_start[i] + mu_idx[i]),
+                        float(sigma[i]),
+                        int(orig_len[i]),
+                        float(S[i]),
+                        float(E[i]),
+                        0.0,
+                    )
                     cur = agg.get(bid)
                     if (cur is None) or (cand[0] > cur[0]):
                         agg[bid] = cand
-                    # HDF5 export for vectors + weights
+
+                    # HDF5 export (unchanged)
                     if (h5o is not None) and (float(P[i]) >= float(args.min_p)):
                         Li = int(Lcpu[i])
-                        s_idx = max(0, min(int(S_idx[i]), Li-1))
-                        e_idx = max(0, min(int(E_idx[i]), Li-1))
+                        s_idx = max(0, min(int(S_idx[i]), Li - 1))
+                        e_idx = max(0, min(int(E_idx[i]), Li - 1))
                         if e_idx < s_idx:
                             s_idx, e_idx = e_idx, s_idx
-                        # Extract raw embedding vectors (exclude positional channel)
-                        vecs = x[i, :Li, :-1].detach().cpu().numpy().astype(np.float32, copy=False)  # (Li, d_model)
-                        # Extract attention weights over valid tokens
-                        wi = w_full[i, :Li].astype(np.float32, copy=False)                            # (Li,)
-                        w_span = wi[s_idx:e_idx+1]                                                     # (N,)
-                        w_sum  = float(w_span.sum())
-                        # Choose positions according to coord system
+                        vecs = x[i, :Li, :-1].detach().cpu().numpy().astype(np.float32, copy=False)
+                        wi = w_full[i, :Li].astype(np.float32, copy=False)
+                        w_span = wi[s_idx:e_idx + 1]
+                        w_sum = float(w_span.sum())
                         if args.h5_coords == 'abs':
-                            pos = (orig_start[i] + np.arange(Li, dtype=np.int64))[s_idx:e_idx+1]
-                        else:  # 'chunk'
-                            pos = np.arange(Li, dtype=np.int64)[s_idx:e_idx+1]
-                        sub_vecs = vecs[s_idx:e_idx+1]  # (N, d_model)
-                        # Create group
-                        key = safe_key(cid)  # use chunk_id for uniqueness
+                            pos = (orig_start[i] + np.arange(Li, dtype=np.int64))[s_idx:e_idx + 1]
+                        else:
+                            pos = np.arange(Li, dtype=np.int64)[s_idx:e_idx + 1]
+                        sub_vecs = vecs[s_idx:e_idx + 1]
+
+                        key = safe_key(cid)
                         if key in items_group:
-                            # Unlikely, but avoid overwrite by appending suffix
                             k = 1
                             while f"{key}__{k}" in items_group:
                                 k += 1
@@ -724,8 +750,7 @@ def main():
                         g = items_group.create_group(key)
                         g.create_dataset('pos', data=pos.astype(np.int32), compression=None)
                         g.create_dataset('vec', data=sub_vecs, compression=None)
-                        g.create_dataset('w',   data=w_span.astype(np.float32, copy=False), compression=None)
-                        # Attach metadata
+                        g.create_dataset('w', data=w_span.astype(np.float32, copy=False), compression=None)
                         g.attrs['chunk_id'] = cid
                         g.attrs['base_id'] = bid
                         g.attrs['coords'] = args.h5_coords
@@ -734,7 +759,7 @@ def main():
                         g.attrs['E_norm'] = float(E[i])
                         g.attrs['S_idx'] = int(s_idx)
                         g.attrs['E_idx'] = int(e_idx)
-                        g.attrs['mu_idx'] = int(np.clip(int(mu_idx[i]), 0, Li-1))
+                        g.attrs['mu_idx'] = int(np.clip(int(mu_idx[i]), 0, Li - 1))
                         g.attrs['sigma'] = float(sigma[i])
                         g.attrs['L'] = int(Lcpu[i])
                         g.attrs['orig_start'] = int(orig_start[i])
@@ -744,8 +769,10 @@ def main():
                         g.attrs['temperature'] = float(T)
                         g.attrs['w_sum'] = w_sum
                         g.attrs['weight_type'] = 'final_attention'
-                        span_src = (f"attn_hpd{int(round(float(args.attn_mass)*100))}"
-                                    if args.discovery else f"attn_mass_k{model.k_sigma:.2f}")
+                        span_src = (
+                            f"attn_hpd{int(round(float(args.attn_mass) * 100))}"
+                            if args.discovery else f"attn_mass_k{model.k_sigma:.2f}"
+                        )
                         g.attrs['span_source'] = span_src
                         if args.discovery:
                             g.attrs['attn_mass'] = float(args.attn_mass)
