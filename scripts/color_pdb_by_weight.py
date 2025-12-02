@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """
 Convert PalmSite per-residue weights (JSON)
-into B-factors in a PDB file derived from an mmCIF structure.
+into B-factors in an mmCIF structure.
+
+Behavior:
+- All atoms in all chains/entities are first set to B-factor = 0.0
+- For entity=<entity>, chain=<chain>, residues that can be mapped to
+  PalmSite positions get scaled weights (0–100) in their B-factor.
+- All other chains / residues keep B-factor = 0.0
 
 Usage:
-    palmsite_color.py \
+    python color_cif_by_weight.py \
         --json 7DTE_weight.json \
         --cif  7DTE.cif \
-        --out  7DTE_attn_colored.pdb
+        --out  7DTE_attn_colored.cif
 """
 
 import argparse
 import json
-from Bio.PDB import MMCIFParser, PDBIO
+from Bio.PDB import MMCIFParser, MMCIFIO
 from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 
 
@@ -85,13 +91,25 @@ def scale_weights(weights):
 
 
 # ---------------------------------------------------------
-# Apply B-factors and write output PDB
+# Apply B-factors and write output mmCIF
 # ---------------------------------------------------------
 def apply_bfactors(cif_path, weights, mapping, chain_id, out_path):
     parser = MMCIFParser(QUIET=True)
     structure = parser.get_structure("structure", cif_path)
+
+    # 1) Set ALL atoms' B-factors to 0.0 (all chains, all entities)
+    for model in structure:
+        for ch in model:
+            for residue in ch:
+                for atom in residue:
+                    atom.set_bfactor(0.0)
+
+    # 2) Apply PalmSite weights ONLY to the chosen chain in the first model
     model = next(structure.get_models())
-    chain = model[chain_id]
+    try:
+        chain = model[chain_id]
+    except KeyError:
+        raise KeyError(f"Chain '{chain_id}' not found in first model")
 
     scaled = scale_weights(weights)
     missing = []
@@ -100,10 +118,11 @@ def apply_bfactors(cif_path, weights, mapping, chain_id, out_path):
         hetflag, auth_seq, icode = residue.id
 
         if hetflag != " ":
-            continue  # skip HETATM
+            continue  # skip HETATM / ligands / waters
 
         key = (chain_id, auth_seq)
         if key not in mapping:
+            # remains at 0.0
             missing.append(auth_seq)
             continue
 
@@ -111,6 +130,7 @@ def apply_bfactors(cif_path, weights, mapping, chain_id, out_path):
         idx0 = seq_index - 1      # 0-based
 
         if not (0 <= idx0 < len(scaled)):
+            # remains at 0.0
             missing.append(auth_seq)
             continue
 
@@ -120,13 +140,17 @@ def apply_bfactors(cif_path, weights, mapping, chain_id, out_path):
             atom.set_bfactor(b)
 
     if missing:
-        print("Warning: Missing mapping for auth_seq_ids:", sorted(set(missing)))
+        print("Warning: no PalmSite weight for auth_seq_ids in chain "
+              f"{chain_id} (B-factor kept at 0.0):",
+              sorted(set(missing)))
 
-    io = PDBIO()
+    io = MMCIFIO()
     io.set_structure(structure)
     io.save(out_path)
 
-    print(f"✔ Wrote colored PDB → {out_path}")
+    print(f"✔ Wrote colored mmCIF → {out_path}")
+    print(f"   Target entity/chain: entity=1 (via mapping), chain={chain_id}")
+    print("   All other chains/entities: B-factor = 0.0")
 
 
 # ---------------------------------------------------------
@@ -134,7 +158,7 @@ def apply_bfactors(cif_path, weights, mapping, chain_id, out_path):
 # ---------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Color a structure by PalmSite weights (writes B-factors)."
+        description="Color an mmCIF structure by PalmSite weights (writes B-factors)."
     )
 
     parser.add_argument("--json", required=True,
@@ -144,7 +168,7 @@ def main():
                         help="Input mmCIF structure")
 
     parser.add_argument("--out", required=True,
-                        help="Output PDB with B-factors")
+                        help="Output mmCIF with modified B-factors")
 
     parser.add_argument("--entity", default="1",
                         help="Entity ID to use (default: 1)")
