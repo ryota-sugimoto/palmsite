@@ -74,7 +74,7 @@ def plot_pr_curves(
       - P vs Rest
       - P vs N
 
-    Saves two PNGs: out_path_rest, out_path_n
+    Saves two PDFs: out_path_rest, out_path_n
     """
     # ----- P vs Rest -----
     plt.figure(figsize=(4, 4))
@@ -105,7 +105,7 @@ def plot_pr_curves(
     plt.legend(fontsize=8)
     os.makedirs(os.path.dirname(out_path_rest) or ".", exist_ok=True)
     plt.tight_layout()
-    plt.savefig(out_path_rest, dpi=300)
+    plt.savefig(out_path_rest)  # PDF
     plt.close()
 
     # ----- P vs N -----
@@ -137,7 +137,7 @@ def plot_pr_curves(
     plt.legend(fontsize=8)
     os.makedirs(os.path.dirname(out_path_n) or ".", exist_ok=True)
     plt.tight_layout()
-    plt.savefig(out_path_n, dpi=300)
+    plt.savefig(out_path_n)  # PDF
     plt.close()
 
 
@@ -152,7 +152,7 @@ def plot_roc_curves(
       - P vs Rest
       - P vs N
 
-    Saves two PNGs: out_path_rest, out_path_n
+    Saves two PDFs: out_path_rest, out_path_n
     """
     # ----- P vs Rest -----
     plt.figure(figsize=(4, 4))
@@ -184,7 +184,7 @@ def plot_roc_curves(
     plt.legend(fontsize=8)
     os.makedirs(os.path.dirname(out_path_rest) or ".", exist_ok=True)
     plt.tight_layout()
-    plt.savefig(out_path_rest, dpi=300)
+    plt.savefig(out_path_rest)  # PDF
     plt.close()
 
     # ----- P vs N -----
@@ -217,7 +217,7 @@ def plot_roc_curves(
     plt.legend(fontsize=8)
     os.makedirs(os.path.dirname(out_path_n) or ".", exist_ok=True)
     plt.tight_layout()
-    plt.savefig(out_path_n, dpi=300)
+    plt.savefig(out_path_n)  # PDF
     plt.close()
 
 
@@ -240,7 +240,7 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help=(
             "Output prefix for figures, e.g. figs/palmsite_test.\n"
-            "Will produce *_pr_p_vs_rest.png, *_pr_p_vs_n.png, *_roc_p_vs_rest.png, *_roc_p_vs_n.png"
+            "Will produce *_pr_p_vs_rest.pdf, *_pr_p_vs_n.pdf, *_roc_p_vs_rest.pdf, *_roc_p_vs_n.pdf"
         ),
     )
     return p.parse_args()
@@ -259,23 +259,24 @@ def main():
 
     # Prepare output filenames
     base = args.out_prefix
-    pr_rest_png = f"{base}_pr_p_vs_rest.png"
-    pr_n_png = f"{base}_pr_p_vs_n.png"
-    roc_rest_png = f"{base}_roc_p_vs_rest.png"
-    roc_n_png = f"{base}_roc_p_vs_n.png"
+    pr_rest_pdf = f"{base}_pr_p_vs_rest.pdf"
+    pr_n_pdf = f"{base}_pr_p_vs_n.pdf"
+    roc_rest_pdf = f"{base}_roc_p_vs_rest.pdf"
+    roc_n_pdf = f"{base}_roc_p_vs_n.pdf"
 
     print("[plot] Plotting PR curves...")
-    plot_pr_curves(evals, labels, pr_rest_png, pr_n_png)
+    plot_pr_curves(evals, labels, pr_rest_pdf, pr_n_pdf)
 
     print("[plot] Plotting ROC curves...")
-    plot_roc_curves(evals, labels, roc_rest_png, roc_n_png)
+    plot_roc_curves(evals, labels, roc_rest_pdf, roc_n_pdf)
 
     print("[plot] Done.")
-    print(f"  PR P vs Rest : {pr_rest_png}")
-    print(f"  PR P vs N    : {pr_n_png}")
-    print(f"  ROC P vs Rest: {roc_rest_png}")
-    print(f"  ROC P vs N   : {roc_n_png}")
+    print(f"  PR P vs Rest : {pr_rest_pdf}")
+    print(f"  PR P vs N    : {pr_n_pdf}")
+    print(f"  ROC P vs Rest: {roc_rest_pdf}")
+    print(f"  ROC P vs N   : {roc_n_pdf}")
 
 
 if __name__ == "__main__":
     main()
+
