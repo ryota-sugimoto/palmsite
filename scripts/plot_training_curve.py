@@ -121,7 +121,8 @@ def plot_curves(metrics: dict, out_path: str, title: str | None = None) -> None:
 
     # Panel A: train loss
     ax0 = axes[0]
-    ax0.plot(epochs, train_loss, marker="o", linewidth=1)
+    ax0.plot(epochs, train_loss, marker=".", linewidth=1)
+    ax0.axvline(best_pr_epoch, linestyle=":", linewidth=1)
     ax0.set_ylabel("Train loss")
     if title:
         ax0.set_title(title)
@@ -134,17 +135,17 @@ def plot_curves(metrics: dict, out_path: str, title: str | None = None) -> None:
     ax1.plot(
         epochs,
         val_pr_rest,
-        marker="o",
-        linewidth=1.2,
-        label="val PR-AUC P vs rest",
+        marker=".",
+        linewidth=1,
+        label="val PR-AUC Positives vs rest",
     )
     ax1.plot(
         epochs,
         val_pr_pn,
-        linestyle="--",
+        linestyle="-",
         marker=".",
         linewidth=1,
-        label="val PR-AUC P vs N",
+        label="val PR-AUC Positives vs Negatives",
     )
 
     ax1.axvline(best_pr_epoch, linestyle=":", linewidth=1)
@@ -166,28 +167,21 @@ def plot_curves(metrics: dict, out_path: str, title: str | None = None) -> None:
     ax2.plot(
         epochs,
         val_iou,
-        marker="o",
-        linewidth=1.2,
+        marker=".",
+        linewidth=1,
         label="val mean IoU",
     )
     ax2.plot(
         epochs,
         val_iou05,
-        linestyle="--",
+        linestyle="-",
         marker=".",
         linewidth=1,
         label="val IoU@0.5",
     )
 
-    ax2.axvline(best_iou_epoch, linestyle=":", linewidth=1)
+    ax2.axvline(best_pr_epoch, linestyle=":", linewidth=1)
     ymax_iou = max(max(val_iou), max(val_iou05))
-    ax2.text(
-        best_iou_epoch + 0.5,
-        ymax_iou,
-        f"best IoU epoch {best_iou_epoch}",
-        va="top",
-        fontsize=8,
-    )
 
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel("IoU")
