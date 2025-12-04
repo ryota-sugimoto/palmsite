@@ -2,8 +2,14 @@
 """
 List entities and chains (struct_asym) with types and lengths from an mmCIF file.
 
+Reports:
+  - Entity summary (ID, type, polymer type, length, description)
+  - Chain summary with BOTH:
+      * label_asym_id (struct_asym.id)
+      * auth_asym_id(s) (from _atom_site.auth_asym_id)
+
 Usage:
-    python list_entities_chains.py 1HI0.cif
+    python cif_summary.py 1HI0.cif
 """
 
 import argparse
@@ -112,10 +118,12 @@ def build_entity_table(mmcif_dict):
 
 def build_chain_table(mmcif_dict, entity_info):
     """
-    Build a list of chain records based on _struct_asym.
+    Build a list of chain records based on _struct_asym and _atom_site.
+
     Each record is a dict:
       {
-        "chain_id": str,
+        "label_chain_id": str,        # struct_asym.id == label_asym_id
+        "auth_chain_ids": str,        # comma-joined unique auth_asym_id(s)
         "entity_id": str,
         "entity_type": str,
         "description": str,
@@ -123,15 +131,35 @@ def build_chain_table(mmcif_dict, entity_info):
         "length": int or None
       }
     """
-    asym_ids = as_list(mmcif_dict, "_struct_asym.id")
+    # Chains from _struct_asym (label-based view)
+    asym_ids = as_list(mmcif_dict, "_struct_asym.id")         # label_asym_id
     asym_entity_ids = as_list(mmcif_dict, "_struct_asym.entity_id")
+
+    # Build mapping: label_asym_id -> set(auth_asym_id) from _atom_site
+    label_asym_atom = as_list(mmcif_dict, "_atom_site.label_asym_id")
+    auth_asym_atom = as_list(mmcif_dict, "_atom_site.auth_asym_id")
+
+    label_to_auth = {}
+    if label_asym_atom and auth_asym_atom:
+        for lab, auth in zip(label_asym_atom, auth_asym_atom):
+            if lab not in label_to_auth:
+                label_to_auth[lab] = set()
+            label_to_auth[lab].add(auth)
 
     chains = []
 
     for asym_id, eid in zip(asym_ids, asym_entity_ids):
         ent = entity_info.get(eid, {})
+        auth_set = label_to_auth.get(asym_id, set())
+        if not auth_set:
+            auth_str = "?"
+        else:
+            # Sort for deterministic output
+            auth_str = ",".join(sorted(auth_set))
+
         chains.append({
-            "chain_id": asym_id,
+            "label_chain_id": asym_id,
+            "auth_chain_ids": auth_str,
             "entity_id": eid,
             "entity_type": ent.get("type", "?"),
             "description": ent.get("description", "?"),
@@ -166,13 +194,14 @@ def print_entity_summary(entity_info):
 
 def print_chain_summary(chains):
     print("=== Chains (struct_asym) ===")
-    header = "{:<8} {:<8} {:<12} {:<20} {:>8}  {}".format(
-        "Chain", "Entity", "EntType", "PolymerType", "Length", "Description"
+    header = "{:<8} {:<10} {:<8} {:<12} {:<20} {:>8}  {}".format(
+        "Label", "Auth", "Entity", "EntType", "PolymerType", "Length", "Description"
     )
     print(header)
     print("-" * len(header))
     for ch in chains:
-        chain_id = ch["chain_id"]
+        label_id = ch["label_chain_id"]
+        auth_ids = ch["auth_chain_ids"]
         eid = ch["entity_id"]
         etype = ch["entity_type"]
         poly_type = ch["poly_type"] or "-"
@@ -180,8 +209,8 @@ def print_chain_summary(chains):
         desc = ch["description"]
         if len(desc) > 80:
             desc = desc[:77] + "..."
-        print("{:<8} {:<8} {:<12} {:<20} {:>8}  {}".format(
-            chain_id, eid, etype, poly_type, length, desc
+        print("{:<8} {:<10} {:<8} {:<12} {:<20} {:>8}  {}".format(
+            label_id, auth_ids, eid, etype, poly_type, length, desc
         ))
     print()
 
@@ -193,7 +222,11 @@ def main():
         epilog=textwrap.dedent(
             """\
             Example:
-              python list_entities_chains.py 1HI0.cif
+              python cif_summary.py 1HI0.cif
+
+            Notes:
+              - 'Label' = _struct_asym.id (label_asym_id)
+              - 'Auth'  = _atom_site.auth_asym_id (author chain ID, as seen in PyMOL)
             """
         ),
     )
