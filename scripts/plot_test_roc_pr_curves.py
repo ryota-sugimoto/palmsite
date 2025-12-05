@@ -91,7 +91,7 @@ def plot_pr_curves(
             plt.plot(
                 recall,
                 precision,
-                label=f"{lab} (AP={auc_val:.3f})",
+                label=f"{lab} (AP={auc_val:.4f})",
             )
         else:
             plt.plot(recall, precision, label=lab)
@@ -123,7 +123,7 @@ def plot_pr_curves(
             plt.plot(
                 recall,
                 precision,
-                label=f"{lab} (AP={auc_val:.3f})",
+                label=f"{lab} (AP={auc_val:.4f})",
             )
         else:
             plt.plot(recall, precision, label=lab)
@@ -169,7 +169,7 @@ def plot_roc_curves(
             plt.plot(
                 fpr,
                 tpr,
-                label=f"{lab} (AUC={auc_val:.3f})",
+                label=f"{lab} (AUC={auc_val:.4f})",
             )
         else:
             plt.plot(fpr, tpr, label=lab)
@@ -202,7 +202,7 @@ def plot_roc_curves(
             plt.plot(
                 fpr,
                 tpr,
-                label=f"{lab} (AUC={auc_val:.3f})",
+                label=f"{lab} (AUC={auc_val:.4f})",
             )
         else:
             plt.plot(fpr, tpr, label=lab)
