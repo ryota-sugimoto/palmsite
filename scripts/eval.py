@@ -321,6 +321,10 @@ def eval_split(
     metrics["n_unlabeled"] = n_unlabeled
     metrics["n_neg"] = n_neg
 
+    # NEW: baseline positive rate for P vs Rest (P vs {U+N})
+    pos_rate_rest = float(n_pos) / float(n_examples) if n_examples > 0 else float("nan")
+    metrics["pos_rate_p_vs_rest"] = pos_rate_rest
+
     # 3) P vs rest (P vs {U+N})
     pr_rest = pr_auc(y_bin, scores)
     metrics["pr_auc_p_vs_rest"] = float(pr_rest)
@@ -346,6 +350,12 @@ def eval_split(
         y_bin_n = y_bin[mask_n_only]
         scores_n = scores[mask_n_only]
 
+        # NEW: baseline positive rate for P vs N (within P+N subset)
+        n_pn = int(y_bin_n.size)
+        n_pos_pn = int((y_bin_n == 1).sum())
+        pos_rate_n = float(n_pos_pn) / float(n_pn) if n_pn > 0 else float("nan")
+        metrics["pos_rate_p_vs_n"] = pos_rate_n
+
         pr_n = pr_auc(y_bin_n, scores_n)
         metrics["pr_auc_p_vs_n"] = float(pr_n)
 
@@ -370,6 +380,8 @@ def eval_split(
         pr_curve_n = {"recall": [], "precision": []}
         metrics["pr_auc_p_vs_n"] = float("nan")
         metrics["roc_auc_p_vs_n"] = float("nan")
+        # NEW: still define baseline, but NaN since no P vs N split
+        metrics["pos_rate_p_vs_n"] = float("nan")
 
     curves = {
         "pr_curve_p_vs_rest": pr_curve_rest,
@@ -387,6 +399,9 @@ def eval_split(
     # Summary print (avoid printing full curves or id list)
     print(f"[eval] Split={split_name} summary:")
     print(f"  n_samples: {n_examples} (P={n_pos}, U={n_unlabeled}, N={n_neg})")
+    print(f"  pos_rate_p_vs_rest (baseline): {pos_rate_rest:.6f}")      # NEW
+    if "pos_rate_p_vs_n" in metrics:
+        print(f"  pos_rate_p_vs_n (baseline):    {metrics['pos_rate_p_vs_n']:.6f}")  # NEW
     print(f"  PR-AUC (P vs rest): {metrics['pr_auc_p_vs_rest']:.4f}")
     print(f"  ROC-AUC (P vs rest): {metrics['roc_auc_p_vs_rest']:.4f}")
     print(f"  PR-AUC (P vs N): {metrics['pr_auc_p_vs_n']:.4f}")
