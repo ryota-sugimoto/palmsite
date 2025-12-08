@@ -13,9 +13,11 @@ Each JSON file is expected to have the structure produced by eval.py:
     "pr_auc_p_vs_n": ...,
     "roc_auc_p_vs_rest": ...,
     "roc_auc_p_vs_n": ...,
+    "pos_rate_p_vs_rest": ...,
+    "pos_rate_p_vs_n": ...,
     ...
   },
-    "curves": {
+  "curves": {
     "pr_curve_p_vs_rest": {
       "recall": [...],
       "precision": [...]
@@ -38,13 +40,13 @@ Each JSON file is expected to have the structure produced by eval.py:
 Usage examples:
 
 # Single model
-python plot_curves.py \
+python plot_test_roc_pr_curves.py \
   --json runs/exp/palmsite_eval_test.json \
   --label PalmSite \
   --out-prefix figs/palmsite_test
 
 # Multiple models on same axes
-python plot_curves.py \
+python plot_test_roc_pr_curves.py \
   --json runs/exp/palmsite_eval_test.json runs/exp/neordrp_eval_test.json \
   --label PalmSite NeoRdRP \
   --out-prefix figs/compare_test
@@ -74,10 +76,15 @@ def plot_pr_curves(
       - P vs Rest
       - P vs N
 
+    Adds a random baseline (horizontal dashed line) using:
+      pos_rate_p_vs_rest / pos_rate_p_vs_n from metrics of the first JSON.
+
     Saves two PDFs: out_path_rest, out_path_n
     """
     # ----- P vs Rest -----
     plt.figure(figsize=(4, 4))
+
+    # Draw model curves
     for ev, lab in zip(evals, labels):
         curves = ev.get("curves", {})
         metrics = ev.get("metrics", {})
@@ -96,6 +103,21 @@ def plot_pr_curves(
         else:
             plt.plot(recall, precision, label=lab)
 
+    # Baseline: random classifier precision = positive rate
+    baseline_rest = None
+    if evals:
+        m0 = evals[0].get("metrics", {})
+        baseline_rest = m0.get("pos_rate_p_vs_rest", None)
+
+    if baseline_rest is not None:
+        plt.axhline(
+            y=baseline_rest,
+            linestyle="--",
+            linewidth=0.8,
+            color="gray",
+            label=f"Random (pos rate={baseline_rest*100:.1f}%)",
+        )
+
     plt.xlabel("Recall")
     plt.ylabel("Precision")
     plt.title("PR curve (P vs Rest)")
@@ -110,6 +132,8 @@ def plot_pr_curves(
 
     # ----- P vs N -----
     plt.figure(figsize=(4, 4))
+
+    # Draw model curves
     for ev, lab in zip(evals, labels):
         curves = ev.get("curves", {})
         metrics = ev.get("metrics", {})
@@ -127,6 +151,21 @@ def plot_pr_curves(
             )
         else:
             plt.plot(recall, precision, label=lab)
+
+    # Baseline: random classifier precision = positive rate (P vs N subset)
+    baseline_n = None
+    if evals:
+        m0 = evals[0].get("metrics", {})
+        baseline_n = m0.get("pos_rate_p_vs_n", None)
+
+    if baseline_n is not None:
+        plt.axhline(
+            y=baseline_n,
+            linestyle="--",
+            linewidth=0.8,
+            color="gray",
+            label=f"Random (pos rate={baseline_n*100:.1f}%)",
+        )
 
     plt.xlabel("Recall")
     plt.ylabel("Precision")
@@ -169,7 +208,7 @@ def plot_roc_curves(
             plt.plot(
                 fpr,
                 tpr,
-                label=f"{lab} (AUC={auc_val:.4f})",
+                label=f"{lab} (AUC={auc_val:.3f})",
             )
         else:
             plt.plot(fpr, tpr, label=lab)
@@ -202,7 +241,7 @@ def plot_roc_curves(
             plt.plot(
                 fpr,
                 tpr,
-                label=f"{lab} (AUC={auc_val:.4f})",
+                label=f"{lab} (AUC={auc_val:.3f})",
             )
         else:
             plt.plot(fpr, tpr, label=lab)
