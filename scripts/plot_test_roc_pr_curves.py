@@ -114,7 +114,7 @@ def plot_pr_curves(
             y=baseline_rest,
             linestyle="--",
             linewidth=0.8,
-            color="gray",
+            color="red",
             label=f"Random (pos rate={baseline_rest*100:.1f}%)",
         )
 
@@ -163,7 +163,7 @@ def plot_pr_curves(
             y=baseline_n,
             linestyle="--",
             linewidth=0.8,
-            color="gray",
+            color="red",
             label=f"Random (pos rate={baseline_n*100:.1f}%)",
         )
 
