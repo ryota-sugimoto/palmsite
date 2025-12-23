@@ -9,7 +9,8 @@ def embed_fastas_to_h5(fasta_path: str, h5_path: str,
                        log_level: str = "INFO",
                        progress_every: int = 25,
                        batch_size: int = 512,
-                       max_tokens_per_batch: int | None = None):
+                       max_tokens_per_batch: int | None = None,
+                       use_subprocess: bool = True):
     """
     Thin wrapper over palmsite._embed_impl (runs it in a subprocess).
 
@@ -56,6 +57,32 @@ def embed_fastas_to_h5(fasta_path: str, h5_path: str,
                 )
         else:
             dev = "cpu"
+
+    
+    # Optionally run embedding in-process to avoid repeated model loads.
+    # This is used by the PalmSite CLI streaming micro-batch scheduler (v0.2.0+).
+    if not use_subprocess:
+        from ._embed_impl import embed_fasta_to_h5
+        # Map shim args to the library API
+        embed_fasta_to_h5(
+            fasta=str(fasta_path),
+            h5=str(h5_path),
+            model=model,
+            device=dev,
+            token=(token or os.getenv('ESM_FORGE_TOKEN')) if backbone == '6b' else None,
+            batch_size=int(batch_size),
+            max_tokens_per_batch=int(max_tokens_per_batch) if max_tokens_per_batch is not None else 0,
+            dtype='float16',
+            chunk_len=2000,
+            chunk_overlap=128,
+            skip_existing=False,
+            overwrite=True,
+            h5_compress='lzf',
+            h5_gzip_level=1,
+            h5_libver='earliest',
+            log_level=str(log_level),
+        )
+        return
 
     cmd = [
         sys.executable, "-m", "palmsite._embed_impl",

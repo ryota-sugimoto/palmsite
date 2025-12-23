@@ -1,7 +1,7 @@
 # **PalmSite — RdRP catalytic center predictor**
 
 PalmSite is a fast command-line tool that predicts the **RNA-dependent RNA polymerase (RdRP) catalytic center** from protein FASTA and outputs **GFF3**.
-As of **v0.1.2**, PalmSite can also optionally output **per-residue attention weights** and **span parameters** in **JSON**.
+As of **v0.2.0**, PalmSite can also optionally output **per-residue attention weights** and **span parameters** in **JSON**.
 
 ---
 
@@ -117,14 +117,16 @@ Usage: palmsite -p 0.5 [-o result.gff] [--attn-json details.json] <fasta ...>
   -o, --gff-out PATH              Write GFF3; default: stdout
   -p, --min-p FLOAT               Minimum probability for GFF [default: 0.5]
   -b, --backbone [300m|600m|6b]   Embedding backbone (local or Forge)
-  -m, --model-id TEXT             HF model repo (default: ryota-sugimoto/palmsite)
-  -d, --device [auto|cpu|cuda]    Device for local models
-  -k, --token TEXT                Forge token for 6B
-  -t, --tmp-dir PATH              Temp directory
+  -m, --model-id TEXT             HF model repo for PalmSite weights (default: ryota-sugimoto/palmsite)
+  -d, --device [auto|cpu|cuda]    Device for local models (ignored for 6b)
+  -k, --token TEXT                Forge token for 6B (or set ESM_FORGE_TOKEN)
+  -t, --tmp-dir PATH              Temp directory (default: auto-created)
   -q, --quiet                     Suppress logs
   -v, --verbose                   Debug logs (overrides quiet)
-  --keep-tmp                      Keep temp files
-  --attn-json PATH                Write per-residue attention JSON
+  --keep-tmp                      Keep temp files (sanitized FASTA + per-batch embeddings)
+  --attn-json PATH                Write per-residue attention JSON (can be large)
+  --micro-batch-seqs INTEGER      Micro-batch size in number of sequences
+  --micro-batch-tokens INTEGER    Micro-batch size cap in ~tokens (sum(len(seq)+2))
   FASTAS...                       One or more FASTA files
 ```
 
@@ -144,8 +146,11 @@ The embedding engine (`_embed_impl.py`) generates an **HDF5** file containing to
 * **300m / 600m** — local Hugging Face models
 * **6B** — via **ESM Forge** API
 
-The CLI invokes this via `embed_shim.py`. 
-Embedding logic: `_embed_impl.py` 
+**Streaming micro-batches (v0.2.0+)**: the CLI runs embedding and prediction in small micro-batches, emitting GFF3 rows incrementally and deleting each temporary embedding HDF5 right after it is consumed (unless you pass `--keep-tmp`). This avoids large peak disk usage for big FASTA inputs.
+
+Tune with:
+* `--micro-batch-tokens` (default: ~80k for local backbones, ~120k for 6b)
+* `--micro-batch-seqs` (optional hard cap on number of sequences per batch)
 
 ### 3. **Predict RdRP domains**
 
@@ -176,12 +181,6 @@ Contains one feature per protein:
 | `AttnMass`                | HPD mass used (if enabled) |
 | `AttnEntropy`             | attention entropy          |
 
-PalmSite exports:
-
-* Per-residue embedding vectors for the predicted catalytic span
-* Final attention weights
-* Metadata (chunk ID, absolute/relative positions, span method)
-
 ---
 
 ## **Environment variables**
@@ -192,7 +191,7 @@ PalmSite exports:
 
 ---
 
-Version: **0.1.2**
+Version: **0.2.0**
 
 ---
 

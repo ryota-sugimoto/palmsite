@@ -44,6 +44,12 @@ LogitsConfig = None
 batch_executor = None
 
 
+# In-process caches to avoid reloading heavy models/clients for each micro-batch.
+# These caches are safe for the PalmSite CLI streaming workflow (v0.2.0+).
+_LOCAL_MODEL_CACHE = {}  # (model_name, device_str) -> ESMC model
+_FORGE_CLIENT_CACHE = {}  # (model_name, url, token_hash16) -> Forge client
+
+
 # ----------------------------
 # Logging
 # ----------------------------
@@ -52,7 +58,7 @@ def setup_logging(level: str = "INFO") -> logging.Logger:
     logger = logging.getLogger("palmsite.embed")
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stderr)
-        fmt = logging.Formatter("[%(levelname)s] %(message)s")
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
         handler.setFormatter(fmt)
         logger.addHandler(handler)
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
@@ -443,7 +449,15 @@ def _run(args, *, as_library: bool = False):
             logger.info(f"Using local ESM-C model: {args.model} on device={dev}")
             # ESM-C local: use client-style API (ESMProtein, encode, logits)
             from esm.sdk.api import ESMProtein as _ESMProtein, LogitsConfig as _LogitsConfig
-            model = ESMC.from_pretrained(args.model).to(dev).eval()
+            # Reuse an already-loaded local model when possible (saves minutes over many micro-batches)
+            cache_key = (args.model, str(dev))
+            model = _LOCAL_MODEL_CACHE.get(cache_key)
+            if model is None:
+                model = ESMC.from_pretrained(args.model).to(dev).eval()
+                _LOCAL_MODEL_CACHE[cache_key] = model
+            else:
+                model.eval()
+
             logits_cfg = _LogitsConfig(sequence=True, return_embeddings=True)
 
             def _embed_local(seq: str) -> np.ndarray:
@@ -465,7 +479,14 @@ def _run(args, *, as_library: bool = False):
                 logger.error(msg)
                 sys.exit(2)
 
-            client = ESM3ForgeInferenceClient(model=args.model, url=args.url, token=tok)
+            # Reuse an already-created Forge client when possible (saves auth/handshake per micro-batch)
+            tok_key = hashlib.sha256(tok.encode('utf-8')).hexdigest()[:16]
+            cache_key = (args.model, str(args.url), tok_key)
+            client = _FORGE_CLIENT_CACHE.get(cache_key)
+            if client is None:
+                client = ESM3ForgeInferenceClient(model=args.model, url=args.url, token=tok)
+                _FORGE_CLIENT_CACHE[cache_key] = client
+
             logits_cfg = LogitsConfig(sequence=True, return_embeddings=True)
 
             def _user_func_for_forge(client, sequence: str) -> np.ndarray:

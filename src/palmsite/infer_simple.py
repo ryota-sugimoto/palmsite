@@ -31,35 +31,24 @@ def _d_model_from_h5(emb_h5: str) -> int:
         return int(g.attrs.get("d_model", g["emb"].shape[1]))
 
 
-def predict_to_gff(
-    embeddings_h5: str,
-    backbone: str,
-    model_id: str | None,
-    revision: str | None,
-    min_p: float,
-    out_stream: IO[str],
-    attn_json: str | None = None,
-) -> None:
-    """
-    Run PalmSite on an embeddings.h5 file and write GFF3 to out_stream.
 
-    If attn_json is not None, also write a JSON file with per-chunk
-    residue-wise attention details (same schema as predict.py/_predict_impl).
-    """
-    try:
-        import torch
-        from torch.utils.data import DataLoader
-        # Import engine only now (it imports torch at module level)
-        from ._predict_impl import (
-            EmbOnlyDataset, collate, RdRPModel, _attn_hpd_span_from_out
-        )
-    except ImportError as e:
-        raise RuntimeError(
-            "PalmSite prediction requires PyTorch. "
-            "Install with: pip install 'palmsite[cpu]' (or use conda 'pytorch')."
-        ) from e
+# Predictor cache: avoid re-loading the PalmSite checkpoint for every micro-batch.
+# Key: (backbone, model_id, revision, d_model, device_str)
+_PREDICTOR_CACHE: Dict[Tuple[str, Optional[str], Optional[str], int, str], Tuple[Any, str, float]] = {}
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def _get_predictor(backbone: str,
+                   model_id: str | None,
+                   revision: str | None,
+                   d_model: int,
+                   device):
+    """Return a cached (model, pos_channel, temperature) tuple."""
+    key = (str(backbone), model_id, revision, int(d_model), str(device))
+    if key in _PREDICTOR_CACHE:
+        return _PREDICTOR_CACHE[key]
+
+    import torch
+    from ._predict_impl import RdRPModel
+
     ckpt_path = fetch_weights(backbone, model_id, revision)
 
     # Load checkpoint (safe when available)
@@ -81,8 +70,7 @@ def predict_to_gff(
     tau_ref    = float(cfg.get("tau_len_ref", 1000.0))
     pos_chan   = str(cfg.get("pos_channel", "end_inclusive"))
 
-    d_model = _d_model_from_h5(embeddings_h5)
-    model = RdRPModel(d_in=d_model + 1, tau=tau, alpha_cap=alpha_cap, p_drop=p_drop).to(device)
+    model = RdRPModel(d_in=int(d_model) + 1, tau=tau, alpha_cap=alpha_cap, p_drop=p_drop).to(device)
     model.wmin_base, model.wmin_floor = wmin_base, wmin_floor
     model.lenfeat_scale = len_scale
     model.k_sigma = k_sigma
@@ -97,16 +85,65 @@ def predict_to_gff(
     # Temperature for calibrated P (if present)
     T = float(ckpt.get("temperature", 1.0)) if isinstance(ckpt, dict) else 1.0
 
+    _PREDICTOR_CACHE[key] = (model, pos_chan, T)
+    return _PREDICTOR_CACHE[key]
+
+
+def predict_to_gff(
+    embeddings_h5: str,
+    backbone: str,
+    model_id: str | None,
+    revision: str | None,
+    min_p: float,
+    out_stream: IO[str],
+    attn_json: str | None = None,
+    *,
+    write_header: bool = True,
+    return_attn: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """
+    Run PalmSite on an embeddings.h5 file and write GFF3 to out_stream.
+
+    If attn_json is not None, also write a JSON file with per-chunk
+    residue-wise attention details (same schema as predict.py/_predict_impl).
+
+    If return_attn is True, return that attention dictionary to the caller
+    (useful for streaming / micro-batch aggregation).
+    """
+    try:
+        import torch
+        from torch.utils.data import DataLoader
+        # Import engine only now (it imports torch at module level)
+        from ._predict_impl import (
+            EmbOnlyDataset, collate
+        )
+    except ImportError as e:
+        raise RuntimeError(
+            "PalmSite prediction requires PyTorch. "
+            "Install with: pip install 'palmsite[cpu]' (or use conda 'pytorch')."
+        ) from e
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    d_model = _d_model_from_h5(embeddings_h5)
+    model, pos_chan, T = _get_predictor(backbone, model_id, revision, d_model, device)
+
     ds = EmbOnlyDataset(embeddings_h5, ids=None, pos_channel=pos_chan)
-    dl = DataLoader(ds, batch_size=64, shuffle=False, num_workers=2, pin_memory=True, collate_fn=collate)
+    # Use single-process DataLoader to avoid forking after HuggingFace tokenizers initialization
+    # (which can emit warnings and, in rare cases, lead to deadlocks).
+    pin = bool(device.type == "cuda")
+    dl = DataLoader(ds, batch_size=64, shuffle=False, num_workers=0, pin_memory=pin, collate_fn=collate)
 
     # Aggregate best per original sequence
     best: Dict[str, Tuple[float, str, int, int, int, float, int]] = {}
 
     # Optional per-chunk residue-wise attention JSON
-    attn_obj: Optional[Dict[str, Any]] = {} if attn_json is not None else None
+    want_attn = (attn_json is not None) or bool(return_attn)
+    attn_obj: Optional[Dict[str, Any]] = {} if want_attn else None
 
-    out_stream.write("##gff-version 3\n")
+    if write_header:
+        out_stream.write("##gff-version 3\n")
+
     with torch.no_grad():
         for b in dl:
             x = b["x"].to(device)
@@ -191,6 +228,7 @@ def predict_to_gff(
             "Name=RdRP_catalytic_center",
             f"Chunk={cid}",
             f"P={Pmax:.6f}",
+            f"mu={aMu}",
             f"sigma={sig:.4f}",
             f"len={Lorig}",
         ]
@@ -206,3 +244,8 @@ def predict_to_gff(
         os.makedirs(os.path.dirname(attn_json) or ".", exist_ok=True)
         with open(attn_json, "w", encoding="utf-8") as fjson:
             json.dump(attn_obj, fjson, indent=2)
+
+    if return_attn:
+        # Always return a dict for caller convenience
+        return attn_obj or {}
+    return None
