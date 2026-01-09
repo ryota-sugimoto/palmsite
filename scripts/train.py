@@ -41,7 +41,7 @@ import time
 import random
 import argparse
 import logging
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Tuple, Dict, Any, Optional, List
 
 import h5py
@@ -109,6 +109,89 @@ def pr_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
         ap += p * max(r - prev_r, 0.0)
         prev_r = r
     return float(ap)
+
+
+def compute_pr_curve(y_true: np.ndarray, y_score: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute a simple precision-recall curve without external dependencies.
+
+    This mirrors the behavior used by scripts/eval.py so train-time and post-hoc
+    evaluation stay consistent.
+
+    Returns:
+        recall:    shape (K,)
+        precision: shape (K,)
+    """
+    y_true = y_true.astype(np.int64)
+    y_score = y_score.astype(np.float64)
+
+    order = np.argsort(-y_score)
+    y = y_true[order]
+
+    P = float((y == 1).sum())
+    if P == 0:
+        return np.array([0.0], dtype=np.float64), np.array([1.0], dtype=np.float64)
+
+    tp = 0.0
+    fp = 0.0
+    precisions: List[float] = []
+    recalls: List[float] = []
+
+    for i in range(len(y)):
+        if y[i] == 1:
+            tp += 1.0
+        else:
+            fp += 1.0
+        precisions.append(tp / (tp + fp))
+        recalls.append(tp / P)
+
+    return np.asarray(recalls, dtype=np.float64), np.asarray(precisions, dtype=np.float64)
+
+
+def compute_roc_curve(y_true: np.ndarray, y_score: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute a simple ROC curve without external dependencies.
+
+    Returns:
+        fpr: shape (K,)
+        tpr: shape (K,)
+    """
+    y_true = y_true.astype(np.int64)
+    y_score = y_score.astype(np.float64)
+
+    order = np.argsort(-y_score)
+    y = y_true[order]
+
+    P = float((y == 1).sum())
+    N = float((y == 0).sum())
+    if P == 0 or N == 0:
+        return np.array([0.0, 1.0], dtype=np.float64), np.array([0.0, 1.0], dtype=np.float64)
+
+    tp = 0.0
+    fp = 0.0
+    tps: List[float] = []
+    fps: List[float] = []
+    for i in range(len(y)):
+        if y[i] == 1:
+            tp += 1.0
+        else:
+            fp += 1.0
+        tps.append(tp)
+        fps.append(fp)
+
+    tps_arr = np.asarray(tps, dtype=np.float64)
+    fps_arr = np.asarray(fps, dtype=np.float64)
+    tpr = tps_arr / P
+    fpr = fps_arr / N
+    return fpr, tpr
+
+
+def roc_auc_from_curve(fpr: np.ndarray, tpr: np.ndarray) -> float:
+    """ROC-AUC from FPR/TPR via trapezoid rule."""
+    if fpr.size < 2:
+        return float('nan')
+    order = np.argsort(fpr)
+    fpr_s = fpr[order]
+    tpr_s = tpr[order]
+    return float(np.trapz(tpr_s, fpr_s))
 
 def recall_at_precision(y_true: np.ndarray, y_score: np.ndarray, min_precision: float = 0.90) -> float:
     """Max recall achievable while maintaining precision >= min_precision."""
@@ -735,6 +818,14 @@ class TrainConfig:
     select_window_stride: int = 60
     disable_iou_best: bool = False
 
+    # Final evaluation (post-training, on test split)
+    # These defaults mirror scripts/eval.py so downstream plotting utilities
+    # (e.g., plot_test_roc_pr_curves.py) can consume the outputs directly.
+    eval_min_precision: List[float] = field(default_factory=lambda: [0.90, 0.95])
+    eval_curves_prefix: str = 'curves'      # relative to out_dir unless absolute
+    eval_out_json: str = 'eval_test.json'   # relative to out_dir unless absolute
+    eval_out_ids: str = 'test_ids.txt'      # relative to out_dir unless absolute
+
 def base_id(cid: str) -> str:
     return str(cid).split("_chunk_")[0]
 
@@ -827,6 +918,208 @@ def evaluate(model: RdRPModel, loader: DataLoader, device: torch.device) -> Dict
     else:
         i_mean, i_at05 = 0.0, 0.0
     return {'pr_auc_p_vs_rest': float(ap_rest), 'pr_auc_p_vs_n': float(ap_n), 'mean_iou': i_mean, 'iou_at_0_5': i_at05}
+
+
+def collect_eval_arrays(
+    model: RdRPModel,
+    loader: DataLoader,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Collect raw labels, scores, chunk ids, and IoU values (for span-labeled examples).
+
+    Returns:
+        y_raw:  (N,) in {0,1,2} = {N, U, P}
+        scores: (N,) sigmoid probabilities
+        ids:    (N,) object array of chunk_ids
+        ious:   (M,) IoU array for use_span==True subset (may be empty)
+    """
+    model.eval()
+    ys_raw: List[np.ndarray] = []
+    scores: List[np.ndarray] = []
+    ids: List[str] = []
+    ious: List[np.ndarray] = []
+
+    with torch.no_grad():
+        for batch in loader:
+            x = batch['x'].to(device)
+            mask = batch['mask'].to(device)
+            L = batch['L'].to(device)
+            out = model(x, mask, L)
+            logits = out['logit']
+            T = getattr(model, 'temperature', None)
+            if T is not None:
+                logits = logits / float(T)
+            P = torch.sigmoid(logits).detach().cpu().numpy()
+
+            y_raw = batch['y'].detach().cpu().numpy()
+            ys_raw.append(y_raw)
+            scores.append(P)
+
+            cids = batch.get('chunk_ids', None)
+            if cids is not None:
+                ids.extend(list(cids))
+
+            m = batch['use_span'].detach().cpu().numpy().astype(bool)
+            if m.any():
+                s_pred = out['S_pred'].detach().cpu().numpy()[m]
+                e_pred = out['E_pred'].detach().cpu().numpy()[m]
+                s_t = batch['S'].detach().cpu().numpy()[m]
+                e_t = batch['E'].detach().cpu().numpy()[m]
+                ious.append(span_iou(s_pred, e_pred, s_t, e_t))
+
+    if not ys_raw:
+        return (
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.float32),
+            np.zeros((0,), dtype=object),
+            np.zeros((0,), dtype=np.float32),
+        )
+
+    y_raw_all = np.concatenate(ys_raw)
+    scores_all = np.concatenate(scores)
+    ids_all = np.array(ids, dtype=object) if ids else np.zeros((0,), dtype=object)
+    iou_all = np.concatenate(ious) if ious else np.zeros((0,), dtype=np.float32)
+    return y_raw_all, scores_all, ids_all, iou_all
+
+
+def eval_split_full(
+    split_name: str,
+    checkpoint_path: str,
+    model: RdRPModel,
+    loader: DataLoader,
+    device: torch.device,
+    min_precisions: List[float],
+) -> Dict[str, Any]:
+    """Full evaluation (metrics + PR/ROC curves + ids) in the same format as scripts/eval.py."""
+    y_raw, scores, ids, iou_all = collect_eval_arrays(model, loader, device)
+    n_examples = int(y_raw.size)
+
+    # Binary labels
+    y_bin = (y_raw == 2).astype(np.int64)  # P vs rest
+
+    # Counts
+    n_pos = int((y_raw == 2).sum())
+    n_unlabeled = int((y_raw == 1).sum())
+    n_neg = int((y_raw == 0).sum())
+
+    # IoU metrics (span-labeled subset)
+    if iou_all.size > 0:
+        mean_iou = float(iou_all.mean())
+        iou_at_0_5 = float((iou_all >= 0.5).mean())
+    else:
+        mean_iou = 0.0
+        iou_at_0_5 = 0.0
+
+    metrics: Dict[str, Any] = {
+        'n_pos': n_pos,
+        'n_unlabeled': n_unlabeled,
+        'n_neg': n_neg,
+        'pos_rate_p_vs_rest': (float(n_pos) / float(n_examples)) if n_examples > 0 else float('nan'),
+        'mean_iou': mean_iou,
+        'iou_at_0_5': iou_at_0_5,
+    }
+
+    curves: Dict[str, Any] = {}
+    if n_examples == 0:
+        return {
+            'checkpoint': os.path.abspath(checkpoint_path),
+            'split': split_name,
+            'min_precisions': [float(x) for x in min_precisions],
+            'n_samples': 0,
+            'metrics': metrics,
+            'curves': curves,
+            'seq_ids': [],
+        }
+
+    # ----- P vs rest -----
+    metrics['pr_auc_p_vs_rest'] = float(pr_auc(y_bin, scores))
+    fpr_rest, tpr_rest = compute_roc_curve(y_bin, scores)
+    metrics['roc_auc_p_vs_rest'] = float(roc_auc_from_curve(fpr_rest, tpr_rest))
+    rec_rest, prec_rest = compute_pr_curve(y_bin, scores)
+    for mp in min_precisions:
+        metrics[f'recall_at_precision_{mp:.2f}_p_vs_rest'] = float(recall_at_precision(y_bin, scores, float(mp)))
+
+    # ----- P vs N (exclude unlabeled) -----
+    mask_pn = (y_raw != 1)
+    if mask_pn.any():
+        y_bin_n = y_bin[mask_pn]
+        scores_n = scores[mask_pn]
+        n_pn = int(y_bin_n.size)
+        n_pos_pn = int((y_bin_n == 1).sum())
+        metrics['pos_rate_p_vs_n'] = (float(n_pos_pn) / float(n_pn)) if n_pn > 0 else float('nan')
+        metrics['pr_auc_p_vs_n'] = float(pr_auc(y_bin_n, scores_n))
+        fpr_n, tpr_n = compute_roc_curve(y_bin_n, scores_n)
+        metrics['roc_auc_p_vs_n'] = float(roc_auc_from_curve(fpr_n, tpr_n))
+        rec_n, prec_n = compute_pr_curve(y_bin_n, scores_n)
+        for mp in min_precisions:
+            metrics[f'recall_at_precision_{mp:.2f}_p_vs_n'] = float(recall_at_precision(y_bin_n, scores_n, float(mp)))
+    else:
+        metrics['pos_rate_p_vs_n'] = float('nan')
+        metrics['pr_auc_p_vs_n'] = float('nan')
+        metrics['roc_auc_p_vs_n'] = float('nan')
+        fpr_n = np.array([], dtype=np.float64)
+        tpr_n = np.array([], dtype=np.float64)
+        rec_n = np.array([], dtype=np.float64)
+        prec_n = np.array([], dtype=np.float64)
+
+    curves = {
+        'pr_curve_p_vs_rest': {'recall': rec_rest.tolist(), 'precision': prec_rest.tolist()},
+        'roc_curve_p_vs_rest': {'fpr': fpr_rest.tolist(), 'tpr': tpr_rest.tolist()},
+        'pr_curve_p_vs_n': {'recall': rec_n.tolist(), 'precision': prec_n.tolist()},
+        'roc_curve_p_vs_n': {'fpr': fpr_n.tolist(), 'tpr': tpr_n.tolist()},
+    }
+
+    return {
+        'checkpoint': os.path.abspath(checkpoint_path),
+        'split': split_name,
+        'min_precisions': [float(x) for x in min_precisions],
+        'n_samples': n_examples,
+        'metrics': metrics,
+        'curves': curves,
+        'seq_ids': ids.tolist(),
+    }
+
+
+def save_curves_tsv(curves: Dict[str, Any], prefix: str, split: str) -> None:
+    """Write PR/ROC curve points as TSV, matching scripts/eval.py naming."""
+    os.makedirs(os.path.dirname(prefix) or '.', exist_ok=True)
+    base = f"{prefix}_{split}"
+
+    pr_rest = curves.get('pr_curve_p_vs_rest', {})
+    roc_rest = curves.get('roc_curve_p_vs_rest', {})
+    rec_rest = np.array(pr_rest.get('recall', []), dtype=float)
+    prec_rest = np.array(pr_rest.get('precision', []), dtype=float)
+    fpr_rest = np.array(roc_rest.get('fpr', []), dtype=float)
+    tpr_rest = np.array(roc_rest.get('tpr', []), dtype=float)
+
+    pr_rest_path = f"{base}_pr_p_vs_rest.tsv"
+    roc_rest_path = f"{base}_roc_p_vs_rest.tsv"
+    with open(pr_rest_path, 'w', encoding='utf-8') as f:
+        f.write('recall\tprecision\n')
+        for r, p in zip(rec_rest, prec_rest):
+            f.write(f"{r:.8g}\t{p:.8g}\n")
+    with open(roc_rest_path, 'w', encoding='utf-8') as f:
+        f.write('fpr\ttpr\n')
+        for x, y in zip(fpr_rest, tpr_rest):
+            f.write(f"{x:.8g}\t{y:.8g}\n")
+
+    pr_n = curves.get('pr_curve_p_vs_n', {})
+    roc_n = curves.get('roc_curve_p_vs_n', {})
+    rec_n = np.array(pr_n.get('recall', []), dtype=float)
+    prec_n = np.array(pr_n.get('precision', []), dtype=float)
+    fpr_n = np.array(roc_n.get('fpr', []), dtype=float)
+    tpr_n = np.array(roc_n.get('tpr', []), dtype=float)
+
+    pr_n_path = f"{base}_pr_p_vs_n.tsv"
+    roc_n_path = f"{base}_roc_p_vs_n.tsv"
+    with open(pr_n_path, 'w', encoding='utf-8') as f:
+        f.write('recall\tprecision\n')
+        for r, p in zip(rec_n, prec_n):
+            f.write(f"{r:.8g}\t{p:.8g}\n")
+    with open(roc_n_path, 'w', encoding='utf-8') as f:
+        f.write('fpr\ttpr\n')
+        for x, y in zip(fpr_n, tpr_n):
+            f.write(f"{x:.8g}\t{y:.8g}\n")
 
 def _collect_scores_full(model: RdRPModel, loader: DataLoader, device: torch.device) -> Tuple[np.ndarray, np.ndarray]:
     model.eval()
@@ -1049,14 +1342,17 @@ def train(cfg: TrainConfig) -> None:
     log_rows: List[Dict[str, Any]] = []
     no_improve = 0
 
+    # Anneal schedule for wmin_base (used during training; we also persist an
+    # inference-time value after training to avoid cfg/inference mismatches).
+    wmin_start = float(cfg.wmin_base)
+    wmin_target = float(max(0.5 * cfg.wmin_base, 20.0))
+    wmin_anneal_E = (cfg.wmin_anneal_epochs if cfg.wmin_anneal_epochs > 0 else max(cfg.epochs // 2, 1))
+
     for epoch in range(1, cfg.epochs + 1):
         # Anneal wmin_base over first half (or --wmin-anneal-epochs)
-        wmin_start = float(cfg.wmin_base)
-        wmin_final = float(max(0.5 * cfg.wmin_base, 20.0))
-        W_E = (cfg.wmin_anneal_epochs if cfg.wmin_anneal_epochs > 0 else max(cfg.epochs // 2, 1))
-        t = min(epoch - 1, W_E)
-        frac = t / max(W_E, 1)
-        model.wmin_base = wmin_start + (wmin_final - wmin_start) * frac
+        t = min(epoch - 1, wmin_anneal_E)
+        frac = t / max(wmin_anneal_E, 1)
+        model.wmin_base = wmin_start + (wmin_target - wmin_start) * frac
 
         # Optional PU-prior annealing
         if cfg.pu_prior_anneal_epochs and cfg.pu_prior_end is not None:
@@ -1180,6 +1476,7 @@ def train(cfg: TrainConfig) -> None:
         row = {
             'epoch': epoch,
             'time_sec': round(train_time, 2),
+            'wmin_base': float(getattr(model, 'wmin_base', cfg.wmin_base)),
             'train_loss': running['loss_total'],
             'train_loss_cls_pu': running['loss_cls_pu'],
             'train_loss_cls_clean': running['loss_cls_clean'],
@@ -1253,6 +1550,27 @@ def train(cfg: TrainConfig) -> None:
                 logging.info(f"Early stopping after {epoch} epochs (patience {cfg.patience}, min_epochs {cfg.min_epochs}).")
                 break
 
+    # Decide what wmin_base should be at inference/evaluation time.
+    #
+    # Rationale: during training, wmin_base is annealed (high→low). The checkpoint
+    # config historically stored the *initial* --wmin-base, which can cause an
+    # inference mismatch when predict.py reconstructs runtime knobs from ckpt cfg.
+    #
+    # Policy:
+    #   - If training ran long enough to finish the anneal schedule, use the
+    #     scheduled target (wmin_target).
+    #   - Otherwise (early stop before anneal completes), use the last value
+    #     actually used by the model at the final epoch.
+    epochs_ran = int(log_rows[-1]['epoch']) if log_rows else 0
+    anneal_completed = (epochs_ran - 1) >= int(wmin_anneal_E)
+    wmin_infer = float(wmin_target if anneal_completed else float(getattr(model, 'wmin_base', wmin_start)))
+    model.wmin_base = wmin_infer
+    model.wmin_floor = float(cfg.wmin_floor)
+    logging.info(
+        f"Inference/eval wmin_base={wmin_infer:.4f} (start={wmin_start:.4f}, target={wmin_target:.4f}, "
+        f"anneal_epochs={int(wmin_anneal_E)}, completed={anneal_completed})"
+    )
+
     # Save last
     torch.save({'model': model.state_dict(), 'cfg': asdict(cfg)}, last_path)
 
@@ -1284,7 +1602,9 @@ def train(cfg: TrainConfig) -> None:
             'dropout': float(cfg.dropout),
             'tau': float(cfg.tau),
             'alpha_cap': float(cfg.alpha_cap),
-            'wmin_base': float(cfg.wmin_base),
+            # IMPORTANT: persist the inference-time wmin_base (post-anneal) to
+            # prevent train/infer drift when wmin_base is annealed during training.
+            'wmin_base': float(wmin_infer),
             'wmin_floor': float(cfg.wmin_floor),
             'lenfeat_scale': float(cfg.lenfeat_scale),
             'pos_channel': str(cfg.pos_channel),
@@ -1292,6 +1612,11 @@ def train(cfg: TrainConfig) -> None:
             'select_metric': str(cfg.select_metric),
             'select_window_len': int(cfg.select_window_len),
             'select_window_stride': int(cfg.select_window_stride),
+            # Metadata (informational)
+            'wmin_base_start': float(wmin_start),
+            'wmin_base_target': float(wmin_target),
+            'wmin_anneal_epochs': int(wmin_anneal_E),
+            'wmin_anneal_completed': bool(anneal_completed),
         }
         T_model = getattr(model, 'temperature', None)
         if T_model is not None:
@@ -1304,6 +1629,42 @@ def train(cfg: TrainConfig) -> None:
     except Exception as e:
         logging.warning(f"Could not write inference_defaults.json: {e}")
 
+    # Patch checkpoints to reflect inference-time wmin_base (post-anneal).
+    #
+    # predict.py (and eval.py) prefer checkpoint['cfg'] over inference_defaults.json.
+    # If we leave cfg.wmin_base at the initial value, runtime sigma clamping drifts
+    # between training (annealed wmin_base) and inference (initial wmin_base).
+    def _patch_ckpt_cfg_for_inference(path: str) -> None:
+        if not path or (not os.path.isfile(path)):
+            return
+        try:
+            ck = torch.load(path, map_location='cpu')
+            if isinstance(ck, dict):
+                cfg_d = ck.get('cfg', None)
+                if isinstance(cfg_d, dict):
+                    cfg_d['wmin_base'] = float(wmin_infer)
+                    cfg_d['wmin_floor'] = float(cfg.wmin_floor)
+                # Preserve anneal provenance without breaking TrainConfig(**cfg)
+                meta = ck.setdefault('anneal', {})
+                if isinstance(meta, dict):
+                    meta.update({
+                        'wmin_base_start': float(wmin_start),
+                        'wmin_base_target': float(wmin_target),
+                        'wmin_base_infer': float(wmin_infer),
+                        'wmin_anneal_epochs': int(wmin_anneal_E),
+                        'wmin_anneal_completed': bool(anneal_completed),
+                    })
+                torch.save(ck, path)
+        except Exception as e:
+            logging.warning(f"Could not patch checkpoint cfg for inference ({path}): {e}")
+
+    _patch_ckpt_cfg_for_inference(best_path)
+    _patch_ckpt_cfg_for_inference(best_pr_path)
+    if not cfg.disable_iou_best:
+        _patch_ckpt_cfg_for_inference(best_iou_path)
+    _patch_ckpt_cfg_for_inference(last_path)
+    _patch_ckpt_cfg_for_inference(os.path.join(cfg.out_dir, 'model_best_calibrated.pt'))
+
     metrics_obj = {'log': log_rows, 'best_sel': best_sel, 'best_by_pr': best_pr}
     if not cfg.disable_iou_best:
         metrics_obj['best_by_iou'] = best_iou
@@ -1313,19 +1674,97 @@ def train(cfg: TrainConfig) -> None:
         json.dump(metrics_obj, f, indent=2)
     logging.info(f"Saved best to {best_path} and last to {last_path}. Metrics -> {metrics_path}")
 
-    test_final = evaluate(model, test_loader, device)
-    with open(os.path.join(cfg.out_dir, 'test_final.json'), 'w') as f:
-        json.dump(test_final, f, indent=2)
+    # ----------------------------
+    # Integrated FINAL evaluation (replaces scripts/eval.py)
+    # ----------------------------
+    def _resolve_out_path(rel_or_abs: str) -> str:
+        if os.path.isabs(rel_or_abs):
+            return rel_or_abs
+        return os.path.join(cfg.out_dir, rel_or_abs)
 
+    try:
+        # Best selection checkpoint (calibrated if enabled)
+        eval_obj = eval_split_full(
+            split_name='test',
+            checkpoint_path=best_path,
+            model=model,
+            loader=test_loader,
+            device=device,
+            min_precisions=[float(x) for x in (cfg.eval_min_precision or [0.90])],
+        )
+
+        # Write the full JSON (metrics + curves) in eval.py-compatible format
+        eval_json_path = _resolve_out_path(cfg.eval_out_json)
+        os.makedirs(os.path.dirname(eval_json_path) or '.', exist_ok=True)
+        with open(eval_json_path, 'w', encoding='utf-8') as f:
+            json.dump({k: v for k, v in eval_obj.items() if k != 'seq_ids'}, f, indent=2)
+
+        # Write IDs (one per line)
+        ids_path = _resolve_out_path(cfg.eval_out_ids)
+        os.makedirs(os.path.dirname(ids_path) or '.', exist_ok=True)
+        with open(ids_path, 'w', encoding='utf-8') as f:
+            for cid in eval_obj.get('seq_ids', []):
+                f.write(f"{cid}\n")
+
+        # Curves TSV export (optional)
+        if cfg.eval_curves_prefix is not None and str(cfg.eval_curves_prefix) != '':
+            curves_prefix = _resolve_out_path(str(cfg.eval_curves_prefix))
+            save_curves_tsv(eval_obj.get('curves', {}), curves_prefix, split='test')
+
+        # Backward-compatible summary JSON (metrics only)
+        with open(os.path.join(cfg.out_dir, 'test_final.json'), 'w', encoding='utf-8') as f:
+            json.dump(eval_obj.get('metrics', {}), f, indent=2)
+
+        m = eval_obj.get('metrics', {})
+        logging.info(
+            "Final TEST (best): "
+            f"PR-AUC(P|rest)={m.get('pr_auc_p_vs_rest', float('nan')):.4f}, "
+            f"ROC-AUC(P|rest)={m.get('roc_auc_p_vs_rest', float('nan')):.4f}, "
+            f"PR-AUC(P|N)={m.get('pr_auc_p_vs_n', float('nan')):.4f}, "
+            f"ROC-AUC(P|N)={m.get('roc_auc_p_vs_n', float('nan')):.4f}, "
+            f"mIoU={m.get('mean_iou', float('nan')):.4f}, "
+            f"IoU@0.5={m.get('iou_at_0_5', float('nan')):.4f}"
+        )
+        logging.info(f"Wrote final eval JSON → {eval_json_path}")
+        logging.info(f"Wrote test ids → {ids_path}")
+    except Exception as e:
+        logging.warning(f"Could not run integrated final evaluation: {e}")
+
+    # Optional: evaluate IoU-best checkpoint on test (metrics-only JSON kept for compatibility)
     if not cfg.disable_iou_best:
         try:
             ckpt_iou = torch.load(os.path.join(cfg.out_dir, 'model_best_iou.pt'), map_location=device)
             model.load_state_dict(ckpt_iou['model'])
             if hasattr(model, 'temperature'):
                 delattr(model, 'temperature')
-            test_final_iou = evaluate(model, test_loader, device)
-            with open(os.path.join(cfg.out_dir, 'test_final_best_iou.json'), 'w') as f:
-                json.dump(test_final_iou, f, indent=2)
+
+            # Ensure inference-time knobs are consistent for IoU-best eval as well
+            model.wmin_base = float(wmin_infer)
+            model.wmin_floor = float(cfg.wmin_floor)
+
+            eval_iou = eval_split_full(
+                split_name='test',
+                checkpoint_path=best_iou_path,
+                model=model,
+                loader=test_loader,
+                device=device,
+                min_precisions=[float(x) for x in (cfg.eval_min_precision or [0.90])],
+            )
+
+            # Metrics-only file name preserved
+            with open(os.path.join(cfg.out_dir, 'test_final_best_iou.json'), 'w', encoding='utf-8') as f:
+                json.dump(eval_iou.get('metrics', {}), f, indent=2)
+
+            # Also write full eval JSON for IoU-best (side-by-side with best)
+            try:
+                base, ext = os.path.splitext(str(cfg.eval_out_json))
+                eval_iou_path = _resolve_out_path(f"{base}_best_iou{ext or '.json'}")
+                with open(eval_iou_path, 'w', encoding='utf-8') as f:
+                    json.dump({k: v for k, v in eval_iou.items() if k != 'seq_ids'}, f, indent=2)
+                logging.info(f"Wrote final eval JSON (IoU-best) → {eval_iou_path}")
+            except Exception:
+                pass
+
             logging.info("Wrote test_final_best_iou.json for IoU-best checkpoint.")
         except Exception as e:
             logging.warning(f"Could not evaluate IoU-best checkpoint: {e}")
@@ -1404,6 +1843,35 @@ def parse_args() -> TrainConfig:
     p.add_argument('--select-window-len', type=int, default=0, help='Window length for ap_win selection (0 disables)')
     p.add_argument('--select-window-stride', type=int, default=60, help='Window stride for ap_win selection')
     p.add_argument('--disable-iou-best', action='store_true', help='Do not save IoU-best checkpoint (still logged)')
+
+    # Final test evaluation outputs (integrated eval.py)
+    p.add_argument(
+        '--eval-min-precision',
+        type=float,
+        nargs='*',
+        default=[0.90, 0.95],
+        help=('Precision thresholds for recall@precision in the final test report '
+              '(default: 0.90 0.95).'),
+    )
+    p.add_argument(
+        '--eval-curves-prefix',
+        type=str,
+        default='curves',
+        help=('Prefix for saving PR/ROC curve TSVs (relative to --out-dir unless absolute). '
+              "Set to '' to disable TSV export."),
+    )
+    p.add_argument(
+        '--eval-out-json',
+        type=str,
+        default='eval_test.json',
+        help=('Output JSON (metrics+curves) for final test evaluation (relative to --out-dir unless absolute).'),
+    )
+    p.add_argument(
+        '--eval-out-ids',
+        type=str,
+        default='test_ids.txt',
+        help=('Output file for test chunk IDs (one per line; relative to --out-dir unless absolute).'),
+    )
     # Scheduler
     p.add_argument('--scheduler', choices=['cosine','warm_restarts','plateau'], default='cosine',
                    help='Learning-rate scheduler to use')
@@ -1478,6 +1946,11 @@ def parse_args() -> TrainConfig:
         lr_factor=args.lr_factor,
         lr_min=args.lr_min,
         wmin_anneal_epochs=args.wmin_anneal_epochs,
+
+        eval_min_precision=list(args.eval_min_precision) if args.eval_min_precision is not None else [0.90],
+        eval_curves_prefix=args.eval_curves_prefix,
+        eval_out_json=args.eval_out_json,
+        eval_out_ids=args.eval_out_ids,
     )
 
 if __name__ == '__main__':

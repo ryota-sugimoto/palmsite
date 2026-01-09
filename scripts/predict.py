@@ -472,7 +472,23 @@ def main():
     except Exception:
         sidecar = {}
 
+    # Some runtime knobs can drift if training anneals them but checkpoints keep
+    # only the initial values. For those keys, prefer the sidecar defaults written
+    # at the end of training.
+    _PREFER_SIDECAR_KEYS = {
+        'wmin_base',
+        'wmin_floor',
+        'lenfeat_scale',
+        'k_sigma',
+        'pos_channel',
+        'coarse_stride',
+        'tau_len_gamma',
+        'tau_len_ref',
+    }
+
     def _get(key, default):
+        if key in _PREFER_SIDECAR_KEYS:
+            return sidecar.get(key, cfg.get(key, default))
         # prefer checkpoint cfg, then sidecar, else hard default
         return cfg.get(key, sidecar.get(key, default))
 

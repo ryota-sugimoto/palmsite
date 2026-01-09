@@ -477,6 +477,18 @@ def main():
         raise RuntimeError("Checkpoint does not contain 'cfg'; ensure it was saved by train.py.")
     cfg = TrainConfig(**ckpt["cfg"])
 
+    # Optional sidecar defaults written by training (helps avoid train/infer drift
+    # for annealed runtime knobs such as wmin_base).
+    try:
+        ckpt_dir = os.path.dirname(args.ckpt)
+        with open(os.path.join(ckpt_dir, 'inference_defaults.json'), 'r', encoding='utf-8') as jf:
+            sidecar = json.load(jf)
+        for k in ('wmin_base', 'wmin_floor', 'lenfeat_scale', 'k_sigma', 'pos_channel', 'coarse_stride', 'tau_len_gamma', 'tau_len_ref'):
+            if k in sidecar and hasattr(cfg, k):
+                setattr(cfg, k, sidecar[k])
+    except Exception:
+        pass
+
     # Override embeddings/labels from CLI if provided
     if args.embeddings is not None:
         cfg.embeddings = args.embeddings
