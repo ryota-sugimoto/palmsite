@@ -895,18 +895,19 @@ def evaluate(model: RdRPModel, loader: DataLoader, device: torch.device) -> Dict
             mask = batch['mask'].to(device, non_blocking=True)
             L = batch['L'].to(device, non_blocking=True)
             y = batch['y'].to(device, non_blocking=True)
-            out = model(x, mask, L)
-            logits = out['logit']
+            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+                out = model(x, mask, L)
+                logits = out['logit']
             T = getattr(model, 'temperature', None)
             if T is not None:
                 logits = logits / float(T)
-            P = torch.sigmoid(logits).detach().cpu().numpy()
+            P = torch.sigmoid(logits).float().detach().cpu().numpy()
             ys.append(batch['y'].cpu().numpy())
             ps.append(P)
             m = batch['use_span'].cpu().numpy().astype(bool)
             if m.any():
-                s_pred = out['S_pred'].detach().cpu().numpy()[m]
-                e_pred = out['E_pred'].detach().cpu().numpy()[m]
+                s_pred = out['S_pred'].detach().float().cpu().numpy()[m]
+                e_pred = out['E_pred'].detach().float().cpu().numpy()[m]
                 s_t = batch['S'].cpu().numpy()[m]
                 e_t = batch['E'].cpu().numpy()[m]
                 iou = span_iou(s_pred, e_pred, s_t, e_t)
@@ -952,12 +953,13 @@ def collect_eval_arrays(
             x = batch['x'].to(device, non_blocking=True)
             mask = batch['mask'].to(device, non_blocking=True)
             L = batch['L'].to(device, non_blocking=True)
-            out = model(x, mask, L)
-            logits = out['logit']
+            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+                out = model(x, mask, L)
+                logits = out['logit']
             T = getattr(model, 'temperature', None)
             if T is not None:
                 logits = logits / float(T)
-            P = torch.sigmoid(logits).detach().cpu().numpy()
+            P = torch.sigmoid(logits).float().detach().cpu().numpy()
 
             y_raw = batch['y'].detach().cpu().numpy()
             ys_raw.append(y_raw)
@@ -969,8 +971,8 @@ def collect_eval_arrays(
 
             m = batch['use_span'].detach().cpu().numpy().astype(bool)
             if m.any():
-                s_pred = out['S_pred'].detach().cpu().numpy()[m]
-                e_pred = out['E_pred'].detach().cpu().numpy()[m]
+                s_pred = out['S_pred'].detach().float().cpu().numpy()[m]
+                e_pred = out['E_pred'].detach().float().cpu().numpy()[m]
                 s_t = batch['S'].detach().cpu().numpy()[m]
                 e_t = batch['E'].detach().cpu().numpy()[m]
                 ious.append(span_iou(s_pred, e_pred, s_t, e_t))
@@ -1134,12 +1136,13 @@ def _collect_scores_full(model: RdRPModel, loader: DataLoader, device: torch.dev
     ys, ps = [], []
     with torch.no_grad():
         for b in loader:
-            out = model(b['x'].to(device, non_blocking=True), b['mask'].to(device, non_blocking=True), b['L'].to(device, non_blocking=True))
-            logits = out['logit']
+            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+                out = model(b['x'].to(device, non_blocking=True), b['mask'].to(device, non_blocking=True), b['L'].to(device, non_blocking=True))
+                logits = out['logit']
             T = getattr(model, 'temperature', None)
             if T is not None:
                 logits = logits / float(T)
-            P = torch.sigmoid(logits).detach().cpu().numpy()
+            P = torch.sigmoid(logits).float().detach().cpu().numpy()
             y = (b['y'].cpu().numpy() == 2).astype(np.int64)
             ys.append(y); ps.append(P)
     return (np.concatenate(ys) if ys else np.zeros((0,), dtype=np.int64),
@@ -1171,12 +1174,15 @@ def _collect_scores_window_max(model: RdRPModel, loader: DataLoader, device: tor
                                 xw[:, -1] = torch.arange(win_len, device=device) / float(win_len)
                         mw = torch.ones(win_len, dtype=torch.bool, device=device)
                         Lw = torch.tensor([win_len], dtype=torch.long, device=device)
-                        outw = model(xw[None, :, :], mw[None, :], Lw)
-                        lw = outw['logit']
+                        with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+                            outw = model(xw[None, :, :], mw[None, :], Lw)
+                            lw = outw['logit']
                         val = max(val, float(torch.sigmoid(lw).item()))
                 else:
-                    out = model(X[i:i+1, :, :], M[i:i+1, :], L[i:i+1])
-                    val = float(torch.sigmoid(out['logit']).item())
+                    with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+                        out = model(X[i:i+1, :, :], M[i:i+1, :], L[i:i+1])
+                        lw = out['logit']
+                    val = float(torch.sigmoid(lw).item())
                 ys.append(y[i]); ps.append(val)
     return np.array(ys, dtype=np.int64), np.array(ps, dtype=np.float32)
 
@@ -1222,8 +1228,10 @@ def calibrate_temperature(model: nn.Module, loader: DataLoader, device: torch.de
             m = (y != 1)
             if not m.any():
                 continue
-            out = model(b["x"].to(device, non_blocking=True), b["mask"].to(device, non_blocking=True), b["L"].to(device, non_blocking=True))
-            logits_list.append(out["logit"][m].detach().cpu())
+            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+                out = model(b["x"].to(device, non_blocking=True), b["mask"].to(device, non_blocking=True), b["L"].to(device, non_blocking=True))
+                logits = out["logit"]
+            logits_list.append(logits[m].detach().float().cpu())
             targets_list.append((y[m] == 2).float().detach().cpu())
     if not logits_list:
         return 1.0

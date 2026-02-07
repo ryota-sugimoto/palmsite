@@ -83,12 +83,13 @@ def collect_scores_with_labels(
             y = batch["y"].to(device)  # 0=N, 1=U, 2=P
             chunk_ids = batch.get("chunk_ids", None)
 
-            out = model(x, mask, L)
-            logits = out["logit"]
+            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+                out = model(x, mask, L)
+                logits = out["logit"]
             T = getattr(model, "temperature", None)
             if T is not None:
                 logits = logits / float(T)
-            P = torch.sigmoid(logits).detach().cpu().numpy()
+            P = torch.sigmoid(logits).float().detach().cpu().numpy()
 
             y_raw = y.cpu().numpy()
             y_bin = (y_raw == 2).astype(np.int64)
