@@ -747,6 +747,12 @@ def _seed_worker(worker_id: int):
     base_seed = torch.initial_seed() % 2**31
     random.seed(base_seed + worker_id)
     np.random.seed(base_seed + worker_id)
+    # Prevent per-worker CPU thread oversubscription (common w/ many workers)
+    try:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
 
 @dataclass
 class TrainConfig:
@@ -775,6 +781,8 @@ class TrainConfig:
     train_frac: float = 0.8
     val_frac: float = 0.1
     num_workers: int = 2
+    prefetch_factor: int = 4           # DataLoader prefetch (only when num_workers>0)
+    dataset_dtype: str = 'float16'     # H5→GPU pipeline dtype (use float32 for CPU training)
     seed: int = 1337
     patience: int = 5
     min_epochs: int = 0                 # ES cannot trigger before this
@@ -863,7 +871,7 @@ def build_datasets(cfg: TrainConfig) -> Tuple[RdRPDataset, RdRPDataset, RdRPData
             ids = np.array([t.decode('utf-8') if isinstance(t, (bytes, bytearray)) else str(t) for t in tmp], dtype=object)
     train_idx, val_idx, test_idx = grouped_split(ids, cfg.train_frac, cfg.val_frac, cfg.seed)
     # Probe d_model
-    tmp_ds = RdRPDataset(cfg.embeddings, cfg.labels, indices=np.array([0]))
+    tmp_ds = RdRPDataset(cfg.embeddings, cfg.labels, indices=np.array([0]), dtype=cfg.dataset_dtype)
     d_model = tmp_ds._get_d_model()
     del tmp_ds
     # Parse crop windows
@@ -872,9 +880,9 @@ def build_datasets(cfg: TrainConfig) -> Tuple[RdRPDataset, RdRPDataset, RdRPData
         cfg.embeddings, cfg.labels, indices=train_idx, is_train=True,
         crop_prob_pos=cfg.crop_prob_pos, crop_prob_un=cfg.crop_prob_un,
         crop_windows=cw, crop_jitter_frac=cfg.crop_jitter_frac, crop_center_only=cfg.crop_center_only,
-        pos_channel=cfg.pos_channel)
-    val_ds = RdRPDataset(cfg.embeddings, cfg.labels, indices=val_idx, is_train=False, pos_channel=cfg.pos_channel)
-    test_ds = RdRPDataset(cfg.embeddings, cfg.labels, indices=test_idx, is_train=False, pos_channel=cfg.pos_channel)
+        pos_channel=cfg.pos_channel, dtype=cfg.dataset_dtype)
+    val_ds = RdRPDataset(cfg.embeddings, cfg.labels, indices=val_idx, is_train=False, pos_channel=cfg.pos_channel, dtype=cfg.dataset_dtype)
+    test_ds = RdRPDataset(cfg.embeddings, cfg.labels, indices=test_idx, is_train=False, pos_channel=cfg.pos_channel, dtype=cfg.dataset_dtype)
     return train_ds, val_ds, test_ds, int(d_model)
 
 
@@ -883,10 +891,10 @@ def evaluate(model: RdRPModel, loader: DataLoader, device: torch.device) -> Dict
     ys = []; ps = []; ious = []
     with torch.no_grad():
         for batch in loader:
-            x = batch['x'].to(device)
-            mask = batch['mask'].to(device)
-            L = batch['L'].to(device)
-            y = batch['y'].to(device)
+            x = batch['x'].to(device, non_blocking=True)
+            mask = batch['mask'].to(device, non_blocking=True)
+            L = batch['L'].to(device, non_blocking=True)
+            y = batch['y'].to(device, non_blocking=True)
             out = model(x, mask, L)
             logits = out['logit']
             T = getattr(model, 'temperature', None)
@@ -941,9 +949,9 @@ def collect_eval_arrays(
 
     with torch.no_grad():
         for batch in loader:
-            x = batch['x'].to(device)
-            mask = batch['mask'].to(device)
-            L = batch['L'].to(device)
+            x = batch['x'].to(device, non_blocking=True)
+            mask = batch['mask'].to(device, non_blocking=True)
+            L = batch['L'].to(device, non_blocking=True)
             out = model(x, mask, L)
             logits = out['logit']
             T = getattr(model, 'temperature', None)
@@ -1126,7 +1134,7 @@ def _collect_scores_full(model: RdRPModel, loader: DataLoader, device: torch.dev
     ys, ps = [], []
     with torch.no_grad():
         for b in loader:
-            out = model(b['x'].to(device), b['mask'].to(device), b['L'].to(device))
+            out = model(b['x'].to(device, non_blocking=True), b['mask'].to(device, non_blocking=True), b['L'].to(device, non_blocking=True))
             logits = out['logit']
             T = getattr(model, 'temperature', None)
             if T is not None:
@@ -1145,9 +1153,9 @@ def _collect_scores_window_max(model: RdRPModel, loader: DataLoader, device: tor
     ys, ps = [], []
     with torch.no_grad():
         for b in loader:
-            X = b['x'].to(device)
-            M = b['mask'].to(device)
-            L = b['L'].to(device)
+            X = b['x'].to(device, non_blocking=True)
+            M = b['mask'].to(device, non_blocking=True)
+            L = b['L'].to(device, non_blocking=True)
             y = (b['y'].cpu().numpy() == 2).astype(np.int64)
             B = X.shape[0]
             for i in range(B):
@@ -1210,11 +1218,11 @@ def calibrate_temperature(model: nn.Module, loader: DataLoader, device: torch.de
     logits_list, targets_list = [], []
     with torch.no_grad():
         for b in loader:
-            y = b["y"].to(device)
+            y = b["y"].to(device, non_blocking=True)
             m = (y != 1)
             if not m.any():
                 continue
-            out = model(b["x"].to(device), b["mask"].to(device), b["L"].to(device))
+            out = model(b["x"].to(device, non_blocking=True), b["mask"].to(device, non_blocking=True), b["L"].to(device, non_blocking=True))
             logits_list.append(out["logit"][m].detach().cpu())
             targets_list.append((y[m] == 2).float().detach().cpu())
     if not logits_list:
@@ -1256,23 +1264,32 @@ def train(cfg: TrainConfig) -> None:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f"Using device: {device}")
 
+    # float16 tensors are ideal for GPU throughput, but CPU training can be slow/unsupported.
+    if device.type != 'cuda' and cfg.dataset_dtype == 'float16':
+        logging.warning('dataset-dtype=float16 on CPU; forcing float32.')
+        cfg.dataset_dtype = 'float32'
+
     train_ds, val_ds, test_ds, d_model = build_datasets(cfg)
     d_in = d_model + 1  # +1 for position channel
     logging.info(f"Detected d_model={d_model}; model input dim={d_in}")
 
-    gen = torch.Generator(); gen.manual_seed(cfg.seed)
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
-                              num_workers=cfg.num_workers, pin_memory=(device.type=='cuda'),
-                              collate_fn=collate_batch, persistent_workers=(cfg.num_workers>0),
-                              worker_init_fn=_seed_worker, generator=gen)
-    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
-                            num_workers=cfg.num_workers, pin_memory=(device.type=='cuda'),
-                            collate_fn=collate_batch, persistent_workers=(cfg.num_workers>0),
-                            worker_init_fn=_seed_worker, generator=gen)
-    test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False,
-                             num_workers=cfg.num_workers, pin_memory=(device.type=='cuda'),
-                             collate_fn=collate_batch, persistent_workers=(cfg.num_workers>0),
-                             worker_init_fn=_seed_worker, generator=gen)
+    gen = torch.Generator()
+    gen.manual_seed(cfg.seed)
+
+    loader_kwargs = dict(
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == 'cuda'),
+        collate_fn=collate_batch,
+        persistent_workers=(cfg.num_workers > 0),
+        worker_init_fn=_seed_worker,
+        generator=gen,
+    )
+    if cfg.num_workers > 0:
+        loader_kwargs['prefetch_factor'] = int(cfg.prefetch_factor)
+
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, **loader_kwargs)
 
     model = RdRPModel(d_in=d_in, tau=cfg.tau, alpha_cap=cfg.alpha_cap, p_drop=cfg.dropout).to(device)
     # Inject discovery knobs
@@ -1363,9 +1380,10 @@ def train(cfg: TrainConfig) -> None:
 
         model.train()
         t0 = time.time()
-        running = {'loss_total': 0.0, 'loss_cls_pu': 0.0, 'loss_cls_clean': 0.0,
-                   'loss_span': 0.0, 'loss_anchor': 0.0, 'loss_align': 0.0,
-                   'loss_alpha_prior': 0.0, 'n': 0}
+        running = {k: torch.zeros((), device=device, dtype=torch.float32) for k in
+                   ['loss_total','loss_cls_pu','loss_cls_clean','loss_span',
+                    'loss_anchor','loss_align','loss_alpha_prior']}
+        n_seen = 0
 
         # Noise warmup/decay
         if cfg.emb_noise_warmup_epochs > 0:
@@ -1379,13 +1397,13 @@ def train(cfg: TrainConfig) -> None:
             sigma_epoch = sigma_epoch * (1.0 - fracd)
 
         for batch in train_loader:
-            x = batch['x'].to(device)
-            mask = batch['mask'].to(device)
-            L = batch['L'].to(device)
-            y = batch['y'].to(device)
-            S_t = batch['S'].to(device)
-            E_t = batch['E'].to(device)
-            use_span = batch['use_span'].to(device)
+            x = batch['x'].to(device, non_blocking=True)
+            mask = batch['mask'].to(device, non_blocking=True)
+            L = batch['L'].to(device, non_blocking=True)
+            y = batch['y'].to(device, non_blocking=True)
+            S_t = batch['S'].to(device, non_blocking=True)
+            E_t = batch['E'].to(device, non_blocking=True)
+            use_span = batch['use_span'].to(device, non_blocking=True)
 
             # Train-time augmentations
             apply_token_dropout(mask, L, y, S_t, E_t, use_span, p=cfg.token_dropout, protect=cfg.token_dropout_protect)
@@ -1448,19 +1466,18 @@ def train(cfg: TrainConfig) -> None:
             scaler.update()
 
             bs = x.size(0)
-            running['loss_total'] += float(loss.item()) * bs
-            running['loss_cls_pu'] += float(l_pu.item()) * bs
-            running['loss_cls_clean'] += float(l_clean.item()) * bs
-            running['loss_span'] += float(l_span.item()) * bs
-            running['loss_anchor'] += float(l_anchor.item()) * bs
-            running['loss_align'] += float(l_align.item()) * bs
-            running['loss_alpha_prior'] += float(l_alpha_prior.item()) * bs
-            running['n'] += bs
+            running['loss_total'] += loss.detach().float() * bs
+            running['loss_cls_pu'] += l_pu.detach().float() * bs
+            running['loss_cls_clean'] += l_clean.detach().float() * bs
+            running['loss_span'] += l_span.detach().float() * bs
+            running['loss_anchor'] += l_anchor.detach().float() * bs
+            running['loss_align'] += l_align.detach().float() * bs
+            running['loss_alpha_prior'] += l_alpha_prior.detach().float() * bs
+            n_seen += bs
 
         train_time = time.time() - t0
-        for k in list(running.keys()):
-            if k != 'n':
-                running[k] = running[k] / max(running['n'], 1)
+        for k in running:
+            running[k] = (running[k] / max(n_seen, 1)).item()
 
         # ----- Validation -----
         val_metrics = evaluate(model, val_loader, device)
@@ -1800,6 +1817,10 @@ def parse_args() -> TrainConfig:
     p.add_argument('--train-frac', type=float, default=0.8, help='Fraction of groups for train split')
     p.add_argument('--val-frac', type=float, default=0.1, help='Fraction of groups for validation split')
     p.add_argument('--num-workers', type=int, default=2, help='DataLoader workers')
+    p.add_argument('--prefetch-factor', type=int, default=4,
+                   help='DataLoader prefetch_factor per worker (only when --num-workers > 0)')
+    p.add_argument('--dataset-dtype', choices=['float16','float32'], default='float16',
+                   help='Dtype for embeddings/pos channel coming from H5 (float16 is faster on GPU; use float32 for CPU).')
     p.add_argument('--seed', type=int, default=1337, help='Random seed for all RNGs')
     # Early stopping / AMP / calibration
     p.add_argument('--patience', type=int, default=5, help='Early stopping patience (epochs without selection gain)')
@@ -1908,6 +1929,8 @@ def parse_args() -> TrainConfig:
         train_frac=args.train_frac,
         val_frac=args.val_frac,
         num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        dataset_dtype=args.dataset_dtype,
         seed=args.seed,
         patience=args.patience,
         min_epochs=args.min_epochs,
