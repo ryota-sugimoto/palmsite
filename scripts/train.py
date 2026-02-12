@@ -826,6 +826,11 @@ class TrainConfig:
     select_window_stride: int = 60
     disable_iou_best: bool = False
 
+    # Checkpointing
+    # Save a checkpoint for every epoch in addition to the existing best/last files.
+    # Can be disabled via --no-save-all-epochs.
+    save_all_epochs: bool = True
+
     # Final evaluation (post-training, on test split)
     # These defaults mirror scripts/eval.py so downstream plotting utilities
     # (e.g., plot_test_roc_pr_curves.py) can consume the outputs directly.
@@ -913,20 +918,55 @@ def evaluate(model: RdRPModel, loader: DataLoader, device: torch.device) -> Dict
                 iou = span_iou(s_pred, e_pred, s_t, e_t)
                 ious.append(iou)
     if not ys:
-        return {'pr_auc_p_vs_rest': 0.0, 'pr_auc_p_vs_n': 0.0, 'mean_iou': 0.0, 'iou_at_0_5': 0.0}
+        return {
+            'pr_auc_p_vs_rest': 0.0,
+            'pr_auc_p_vs_n': 0.0,
+            'recall_at_precision_0.90_p_vs_rest': 0.0,
+            'recall_at_precision_0.95_p_vs_rest': 0.0,
+            'recall_at_precision_0.99_p_vs_rest': 0.0,
+            'recall_at_precision_0.90_p_vs_n': 0.0,
+            'recall_at_precision_0.95_p_vs_n': 0.0,
+            'recall_at_precision_0.99_p_vs_n': 0.0,
+            'mean_iou': 0.0,
+            'iou_at_0_5': 0.0,
+        }
     y_all = np.concatenate(ys)
     p_all = np.concatenate(ps)
     y_p_vs_rest = (y_all == 2).astype(np.int64)
     ap_rest = pr_auc(y_p_vs_rest, p_all)
     mask_n_only = (y_all != 1)
     ap_n = pr_auc(y_p_vs_rest[mask_n_only], p_all[mask_n_only]) if mask_n_only.any() else 0.0
+
+    # Recall at precision (often summarized as recall@{90,95,99} precision)
+    rap_90_rest = recall_at_precision(y_p_vs_rest, p_all, 0.90)
+    rap_95_rest = recall_at_precision(y_p_vs_rest, p_all, 0.95)
+    rap_99_rest = recall_at_precision(y_p_vs_rest, p_all, 0.99)
+    if mask_n_only.any():
+        rap_90_n = recall_at_precision(y_p_vs_rest[mask_n_only], p_all[mask_n_only], 0.90)
+        rap_95_n = recall_at_precision(y_p_vs_rest[mask_n_only], p_all[mask_n_only], 0.95)
+        rap_99_n = recall_at_precision(y_p_vs_rest[mask_n_only], p_all[mask_n_only], 0.99)
+    else:
+        rap_90_n = 0.0
+        rap_95_n = 0.0
+        rap_99_n = 0.0
     if ious:
         i_all = np.concatenate(ious)
         i_mean = float(i_all.mean())
         i_at05 = float((i_all >= 0.5).mean())
     else:
         i_mean, i_at05 = 0.0, 0.0
-    return {'pr_auc_p_vs_rest': float(ap_rest), 'pr_auc_p_vs_n': float(ap_n), 'mean_iou': i_mean, 'iou_at_0_5': i_at05}
+    return {
+        'pr_auc_p_vs_rest': float(ap_rest),
+        'pr_auc_p_vs_n': float(ap_n),
+        'recall_at_precision_0.90_p_vs_rest': float(rap_90_rest),
+        'recall_at_precision_0.95_p_vs_rest': float(rap_95_rest),
+        'recall_at_precision_0.99_p_vs_rest': float(rap_99_rest),
+        'recall_at_precision_0.90_p_vs_n': float(rap_90_n),
+        'recall_at_precision_0.95_p_vs_n': float(rap_95_n),
+        'recall_at_precision_0.99_p_vs_n': float(rap_99_n),
+        'mean_iou': i_mean,
+        'iou_at_0_5': i_at05,
+    }
 
 
 def collect_eval_arrays(
@@ -1515,13 +1555,17 @@ def train(cfg: TrainConfig) -> None:
             row[f'val_{k}'] = v
         log_rows.append(row)
 
+        r_at_p90 = float(row.get('val_recall_at_precision_0.90_p_vs_rest', float('nan')))
+        r_at_p95 = float(row.get('val_recall_at_precision_0.95_p_vs_rest', float('nan')))
+        r_at_p99 = float(row.get('val_recall_at_precision_0.99_p_vs_rest', float('nan')))
         logging.info(
             f"Epoch {epoch:03d} | pi={loss_pu.pi:.3f} | train={row['train_loss']:.4f} "
             f"(pu={row['train_loss_cls_pu']:.3f}, clean={row['train_loss_cls_clean']:.3f}, "
             f"span={row['train_loss_span']:.3f}, anchor={row['train_loss_anchor']:.3f}, "
             f"align={row['train_loss_align']:.3f}, a_prior={row['train_loss_alpha_prior']:.3f}) | "
-            f"val_AP(P|rest)={row['val_pr_auc_p_vs_rest']:.4f} | IoU@0.5={row['val_iou_at_0_5']:.3f} | "
-            f"time={row['time_sec']:.1f}s"
+            f"val_AP(P|rest)={row['val_pr_auc_p_vs_rest']:.4f} | "
+            f"R@P0.90={r_at_p90:.3f} | R@P0.95={r_at_p95:.3f} | R@P0.99={r_at_p99:.3f} | "
+            f"IoU@0.5={row['val_iou_at_0_5']:.3f} | time={row['time_sec']:.1f}s"
         )
 
         # Winners tracking
@@ -1536,6 +1580,26 @@ def train(cfg: TrainConfig) -> None:
             best_iou.update({'mean_iou': miou, 'pr_auc': pr, 'epoch': epoch})
             torch.save({'model': model.state_dict(), 'cfg': asdict(cfg)}, best_iou_path)
             logging.info(f"Saved IoU reference checkpoint → {best_iou_path} (mIoU={miou:.6f}, PR={pr:.6f})")
+
+        # Per-epoch checkpoint (in addition to best/last)
+        if cfg.save_all_epochs:
+            try:
+                ep_path = os.path.join(cfg.out_dir, f"model_epoch_{epoch:03d}.pt")
+                cfg_ep = asdict(cfg)
+                # Record the wmin_base actually used at this epoch (important under annealing)
+                cfg_ep['wmin_base'] = float(getattr(model, 'wmin_base', cfg.wmin_base))
+                torch.save(
+                    {
+                        'model': model.state_dict(),
+                        'cfg': cfg_ep,
+                        'epoch': int(epoch),
+                        'train_losses': dict(running),
+                        'val_metrics': dict(val_metrics),
+                    },
+                    ep_path,
+                )
+            except Exception as e:
+                logging.warning(f"Could not save per-epoch checkpoint for epoch {epoch}: {e}")
 
         # Selection metric (drives early stopping & model_best.pt)
         if cfg.select_metric == 'ap':
@@ -1835,6 +1899,12 @@ def parse_args() -> TrainConfig:
     p.add_argument('--min-epochs', type=int, default=0, help='Do not early-stop before this many epochs')
     p.add_argument('--no-amp', action='store_true', help='Disable mixed precision even on CUDA')
     p.add_argument('--calibrate', action='store_true', help='Calibrate temperature on validation set (saves T into checkpoint)')
+    # Checkpointing
+    p.add_argument(
+        '--no-save-all-epochs',
+        action='store_true',
+        help='Disable per-epoch checkpoints (default: save model_epoch_XXX.pt each epoch).'
+    )
     # Alignment/priors
     p.add_argument('--anchor-align-kl', type=float, default=0.10, help='Weight for KL(w || soft-span-mask); 0 disables')
     p.add_argument('--anchor-align-ramp', type=float, default=0.05, help='Cosine ramp width (fraction of length) on span edges')
@@ -1944,6 +2014,7 @@ def parse_args() -> TrainConfig:
         min_epochs=args.min_epochs,
         amp=not args.no_amp,
         calibrate=args.calibrate,
+        save_all_epochs=(not args.no_save_all_epochs),
         wmin_base=args.wmin_base,
         wmin_floor=args.wmin_floor,
         lenfeat_scale=args.lenfeat_scale,
@@ -1987,4 +2058,5 @@ def parse_args() -> TrainConfig:
 if __name__ == '__main__':
     cfg = parse_args()
     train(cfg)
+
 
