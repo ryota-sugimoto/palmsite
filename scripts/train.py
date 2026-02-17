@@ -969,6 +969,111 @@ def evaluate(model: RdRPModel, loader: DataLoader, device: torch.device) -> Dict
     }
 
 
+
+@torch.no_grad()
+def evaluate_losses(
+    model: RdRPModel,
+    loader: DataLoader,
+    device: torch.device,
+    cfg: 'TrainConfig',
+    loss_pu: 'NnPULoss',
+    loss_clean: 'CleanNegLoss',
+    loss_span: 'SpanLoss',
+    loss_anchor: 'AnchorReg',
+) -> Dict[str, float]:
+    """Compute validation losses (total + components) without augmentations.
+
+    Mirrors the train-time loss composition so we can track learning dynamics and
+    overfitting with directly comparable quantities.
+    """
+    model.eval()
+    running = {k: torch.zeros((), device=device, dtype=torch.float32) for k in
+               ['loss_total','loss_cls_pu','loss_cls_clean','loss_span',
+                'loss_anchor','loss_align','loss_alpha_prior','loss_contrast']}
+    n_seen = 0
+
+    # AMP (new API with fallback)
+    try:
+        from torch.amp import autocast  # PyTorch 2.x
+        _NEW_AMP = True
+    except Exception:
+        from torch.cuda.amp import autocast  # PyTorch 1.x
+        _NEW_AMP = False
+
+    for batch in loader:
+        x = batch['x'].to(device, non_blocking=True)
+        mask = batch['mask'].to(device, non_blocking=True)
+        L = batch['L'].to(device, non_blocking=True)
+        y = batch['y'].to(device, non_blocking=True)
+        S_t = batch['S'].to(device, non_blocking=True)
+        E_t = batch['E'].to(device, non_blocking=True)
+        use_span = batch['use_span'].to(device, non_blocking=True)
+
+        amp_enabled = (device.type == 'cuda' and cfg.amp)
+        ctx = autocast('cuda', enabled=amp_enabled) if _NEW_AMP else autocast(enabled=amp_enabled)
+        with ctx:
+            out = model(x, mask, L)
+            logits = out['logit']
+
+            l_pu = loss_pu(logits, y)
+            l_clean = loss_clean(logits, y)
+            l_span = cfg.lambda_span * loss_span(out['S_pred'], out['E_pred'], S_t, E_t, use_span)
+            l_anchor = loss_anchor(out['mu'], out['sigma'], S_t, E_t, use_span)
+
+            if cfg.anchor_align_kl > 0.0:
+                m = build_soft_span_mask_like(out['w'], S_t, E_t, ramp=cfg.anchor_align_ramp)
+                m = m / (m.sum(dim=1, keepdim=True) + 1e-8)
+                w_norm = out['w'] / (out['w'].sum(dim=1, keepdim=True) + 1e-8)
+                kl = (w_norm.clamp_min(1e-8) *
+                      (w_norm.clamp_min(1e-8).log() - m.clamp_min(1e-8).log())).sum(dim=1)
+                l_align = (kl * use_span.float()).mean() * cfg.anchor_align_kl
+            else:
+                l_align = logits.new_tensor(0.0)
+
+            l_alpha_prior = (torch.exp(-out['alpha']).mean() * cfg.anchor_alpha_prior) if cfg.anchor_alpha_prior > 0.0 else logits.new_tensor(0.0)
+
+            l_contrast = logits.new_tensor(0.0)
+            if cfg.lambda_contrast > 0.0:
+                mpos = (y == 2) & use_span
+                if mpos.any():
+                    logit_pos = out['logit'][mpos]
+                    Spos = S_t[mpos]; Epos = E_t[mpos]
+                    mu_neg = torch.where((0.5 * (Spos + Epos)) < 0.5,
+                                         torch.clamp(Epos + 0.2, max=1.0),
+                                         torch.clamp(Spos - 0.2, min=0.0))
+                    sigma_neg = out['sigma'][mpos].detach()
+                    zc = (out['z'][mpos] - (out['z'][mpos] * mask[mpos].to(out['z'].dtype)).sum(dim=1, keepdim=True)
+                          / mask[mpos].to(out['z'].dtype).sum(dim=1, keepdim=True).clamp(min=1.0))
+                    pos_grid = torch.linspace(0, 1, zc.shape[1], device=zc.device).view(1, -1).expand(zc.shape[0], -1)
+                    q_neg = -0.5 * ((pos_grid - mu_neg.unsqueeze(1)) / sigma_neg.unsqueeze(1)).pow(2)
+                    a_neg = zc + out['alpha'][mpos].unsqueeze(1) * q_neg
+                    very_neg = torch.finfo(a_neg.dtype).min / 2
+                    a_neg = a_neg.masked_fill(~mask[mpos], very_neg)
+                    w_neg = torch.softmax(a_neg, dim=1)
+                    c_neg = torch.einsum('bt,btc->bc', w_neg.float(), out['H'][mpos].float()).to(out['H'].dtype)
+                    lenf_pos = model._len_feat(L[mpos])
+                    logit_neg = model.heads.seq_head(torch.cat([c_neg, lenf_pos], dim=-1)).squeeze(-1)
+                    l_contrast = torch.relu(cfg.contrast_margin - (logit_pos - logit_neg)).mean() * cfg.lambda_contrast
+
+            loss = l_pu + l_clean + l_span + l_anchor + l_align + l_alpha_prior + l_contrast
+
+        bs = x.size(0)
+        running['loss_total'] += loss.detach().float() * bs
+        running['loss_cls_pu'] += l_pu.detach().float() * bs
+        running['loss_cls_clean'] += l_clean.detach().float() * bs
+        running['loss_span'] += l_span.detach().float() * bs
+        running['loss_anchor'] += l_anchor.detach().float() * bs
+        running['loss_align'] += l_align.detach().float() * bs
+        running['loss_alpha_prior'] += l_alpha_prior.detach().float() * bs
+        running['loss_contrast'] += l_contrast.detach().float() * bs
+        n_seen += bs
+
+    if n_seen <= 0:
+        return {k: 0.0 for k in running}
+
+    return {k: float((v / float(n_seen)).item()) for k, v in running.items()}
+
+
 def collect_eval_arrays(
     model: RdRPModel,
     loader: DataLoader,
@@ -1430,7 +1535,7 @@ def train(cfg: TrainConfig) -> None:
         t0 = time.time()
         running = {k: torch.zeros((), device=device, dtype=torch.float32) for k in
                    ['loss_total','loss_cls_pu','loss_cls_clean','loss_span',
-                    'loss_anchor','loss_align','loss_alpha_prior']}
+                    'loss_anchor','loss_align','loss_alpha_prior','loss_contrast']}
         n_seen = 0
 
         # Noise warmup/decay
@@ -1521,6 +1626,7 @@ def train(cfg: TrainConfig) -> None:
             running['loss_anchor'] += l_anchor.detach().float() * bs
             running['loss_align'] += l_align.detach().float() * bs
             running['loss_alpha_prior'] += l_alpha_prior.detach().float() * bs
+            running['loss_contrast'] += l_contrast.detach().float() * bs
             n_seen += bs
 
         train_time = time.time() - t0
@@ -1529,6 +1635,7 @@ def train(cfg: TrainConfig) -> None:
 
         # ----- Validation -----
         val_metrics = evaluate(model, val_loader, device)
+        val_losses = evaluate_losses(model, val_loader, device, cfg, loss_pu, loss_clean, loss_span, loss_anchor)
 
         # ----- Scheduler step (AFTER validation) -----
         if scheduler is not None:
@@ -1549,8 +1656,11 @@ def train(cfg: TrainConfig) -> None:
             'train_loss_anchor': running['loss_anchor'],
             'train_loss_align': running['loss_align'],
             'train_loss_alpha_prior': running['loss_alpha_prior'],
+            'train_loss_contrast': running.get('loss_contrast', 0.0),
             'pi': float(loss_pu.pi),
         }
+        for k, v in val_losses.items():
+            row[f'val_{k}'] = v
         for k, v in val_metrics.items():
             row[f'val_{k}'] = v
         log_rows.append(row)
@@ -1562,7 +1672,13 @@ def train(cfg: TrainConfig) -> None:
             f"Epoch {epoch:03d} | pi={loss_pu.pi:.3f} | train={row['train_loss']:.4f} "
             f"(pu={row['train_loss_cls_pu']:.3f}, clean={row['train_loss_cls_clean']:.3f}, "
             f"span={row['train_loss_span']:.3f}, anchor={row['train_loss_anchor']:.3f}, "
-            f"align={row['train_loss_align']:.3f}, a_prior={row['train_loss_alpha_prior']:.3f}) | "
+            f"align={row['train_loss_align']:.3f}, a_prior={row['train_loss_alpha_prior']:.3f}, "
+            f"contrast={row.get('train_loss_contrast', 0.0):.3f}) | "
+            f"val_loss={row.get('val_loss_total', float('nan')):.4f} "
+            f"(pu={row.get('val_loss_cls_pu', float('nan')):.3f}, clean={row.get('val_loss_cls_clean', float('nan')):.3f}, "
+            f"span={row.get('val_loss_span', float('nan')):.3f}, anchor={row.get('val_loss_anchor', float('nan')):.3f}, "
+            f"align={row.get('val_loss_align', float('nan')):.3f}, a_prior={row.get('val_loss_alpha_prior', float('nan')):.3f}, "
+            f"contrast={row.get('val_loss_contrast', float('nan')):.3f}) | "
             f"val_AP(P|rest)={row['val_pr_auc_p_vs_rest']:.4f} | "
             f"R@P0.90={r_at_p90:.3f} | R@P0.95={r_at_p95:.3f} | R@P0.99={r_at_p99:.3f} | "
             f"IoU@0.5={row['val_iou_at_0_5']:.3f} | time={row['time_sec']:.1f}s"
