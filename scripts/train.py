@@ -788,6 +788,7 @@ class TrainConfig:
     min_epochs: int = 0                 # ES cannot trigger before this
     scheduler: str = 'cosine'           # {'cosine','warm_restarts','plateau'}
     eta_min: float = 1e-6               # for cosine schedules
+    cosine_tmax: int = 0               # 0 → use epochs; if epochs>tmax, LR is held at eta_min after tmax
     t0: int = 10                        # warm restarts: first cycle length
     t_mult: float = 2.0                 # warm restarts: cycle multiplier
     lr_patience: int = 5                # plateau: epochs w/o improvement
@@ -813,6 +814,7 @@ class TrainConfig:
     emb_noise_std: float = 0.0
     emb_noise_warmup_epochs: int = 0
     emb_noise_decay_epochs: int = 0   # 0 = no decay
+    emb_noise_decay_start_epoch: int = -1  # <0 → use min_epochs (backward compatible)
     crop_prob_pos: float = 0.0
     crop_prob_un: float = 0.0
     crop_windows: str = ''  # CSV
@@ -852,11 +854,14 @@ def grouped_split(ids: np.ndarray, train_frac: float, val_frac: float, seed: int
     rng.shuffle(group_keys)
     n_train = int(len(group_keys) * train_frac)
     n_val = int(len(group_keys) * val_frac)
-    g_train = set(group_keys[:n_train])
-    g_val   = set(group_keys[n_train:n_train+n_val])
-    g_test  = set(group_keys[n_train+n_val:])
+    # IMPORTANT: keep group order deterministic. Using Python `set` here makes
+    # iteration order dependent on hash randomization (PYTHONHASHSEED), which can
+    # break reproducibility even when --seed is fixed.
+    g_train = group_keys[:n_train].tolist()
+    g_val   = group_keys[n_train:n_train+n_val].tolist()
+    g_test  = group_keys[n_train+n_val:].tolist()
 
-    def idx_from(gs: set) -> np.ndarray:
+    def idx_from(gs: List[str]) -> np.ndarray:
         out: List[int] = []
         for g in gs:
             out.extend(groups[g])
@@ -1472,8 +1477,14 @@ def train(cfg: TrainConfig) -> None:
             pass
 
     # LR scheduler (chosen by --scheduler)
+    cosine_tmax_eff: Optional[int] = None
     if cfg.scheduler == 'cosine':
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs, eta_min=cfg.eta_min)
+        # By default we use T_max=epochs (original behavior). If --cosine-tmax is
+        # set, we use that value instead. When epochs > T_max we *hold* LR at
+        # eta_min after completing the cosine cycle (see scheduler stepping below)
+        # to avoid unintentionally increasing LR again.
+        cosine_tmax_eff = int(cfg.cosine_tmax) if int(getattr(cfg, 'cosine_tmax', 0)) > 0 else int(cfg.epochs)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cosine_tmax_eff, eta_min=cfg.eta_min)
     elif cfg.scheduler == 'warm_restarts':
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=cfg.t0, T_mult=cfg.t_mult, eta_min=cfg.eta_min)
     elif cfg.scheduler == 'plateau':
@@ -1532,6 +1543,9 @@ def train(cfg: TrainConfig) -> None:
             loss_pu.pi = float(start + (cfg.pu_prior_end - start) * frac)
 
         model.train()
+        # Record the LR actually used during this epoch (before scheduler.step)
+        lr_base_epoch = float(opt.param_groups[0]['lr']) if len(opt.param_groups) > 0 else float('nan')
+        lr_alpha_epoch = float(opt.param_groups[1]['lr']) if len(opt.param_groups) > 1 else float('nan')
         t0 = time.time()
         running = {k: torch.zeros((), device=device, dtype=torch.float32) for k in
                    ['loss_total','loss_cls_pu','loss_cls_clean','loss_span',
@@ -1544,8 +1558,9 @@ def train(cfg: TrainConfig) -> None:
             sigma_epoch = float(cfg.emb_noise_std) * warm
         else:
             sigma_epoch = float(cfg.emb_noise_std)
-        if cfg.emb_noise_decay_epochs > 0 and epoch > cfg.min_epochs:
-            tdec = max(0, epoch - cfg.min_epochs)
+        decay_start = int(cfg.emb_noise_decay_start_epoch) if int(getattr(cfg, 'emb_noise_decay_start_epoch', -1)) >= 0 else int(cfg.min_epochs)
+        if cfg.emb_noise_decay_epochs > 0 and epoch > decay_start:
+            tdec = max(0, epoch - decay_start)
             fracd = min(tdec / max(cfg.emb_noise_decay_epochs, 1), 1.0)
             sigma_epoch = sigma_epoch * (1.0 - fracd)
 
@@ -1641,12 +1656,20 @@ def train(cfg: TrainConfig) -> None:
         if scheduler is not None:
             if cfg.scheduler == 'plateau':
                 scheduler.step(val_metrics['pr_auc_p_vs_rest'])
+            elif cfg.scheduler == 'cosine' and cosine_tmax_eff is not None and epoch > int(cosine_tmax_eff):
+                # Hold LR at eta_min after completing the cosine cycle. (PyTorch's
+                # CosineAnnealingLR will start increasing LR again if stepped past T_max.)
+                pass
             else:
                 scheduler.step()
 
         # Log row
         row = {
             'epoch': epoch,
+            'lr': lr_base_epoch,
+            'lr_alpha': lr_alpha_epoch,
+            'emb_noise_sigma': float(sigma_epoch),
+            'emb_noise_decay_start': int(decay_start),
             'time_sec': round(train_time, 2),
             'wmin_base': float(getattr(model, 'wmin_base', cfg.wmin_base)),
             'train_loss': running['loss_total'],
@@ -1669,7 +1692,7 @@ def train(cfg: TrainConfig) -> None:
         r_at_p95 = float(row.get('val_recall_at_precision_0.95_p_vs_rest', float('nan')))
         r_at_p99 = float(row.get('val_recall_at_precision_0.99_p_vs_rest', float('nan')))
         logging.info(
-            f"Epoch {epoch:03d} | pi={loss_pu.pi:.3f} | train={row['train_loss']:.4f} "
+            f"Epoch {epoch:03d} | lr={lr_base_epoch:.3e} | sigma={float(sigma_epoch):.4f} | pi={loss_pu.pi:.3f} | train={row['train_loss']:.4f} "
             f"(pu={row['train_loss_cls_pu']:.3f}, clean={row['train_loss_cls_clean']:.3f}, "
             f"span={row['train_loss_span']:.3f}, anchor={row['train_loss_anchor']:.3f}, "
             f"align={row['train_loss_align']:.3f}, a_prior={row['train_loss_alpha_prior']:.3f}, "
@@ -2041,7 +2064,10 @@ def parse_args() -> TrainConfig:
     p.add_argument('--token-dropout-protect', type=int, default=10, help='Protect ±N residues around positive span center')
     p.add_argument('--emb-noise-std', type=float, default=0.0, help='Gaussian noise std on embedding channels at train-time')
     p.add_argument('--emb-noise-warmup-epochs', type=int, default=0, help='Warmup epochs for noise from 0→std')
-    p.add_argument('--emb-noise-decay-epochs', type=int, default=0, help='After --min-epochs, linearly decay noise to 0 over these epochs')
+    p.add_argument('--emb-noise-decay-epochs', type=int, default=0,
+                   help='Linearly decay embedding noise to 0 over these epochs (decay starts after --emb-noise-decay-start-epoch; default: after --min-epochs)')
+    p.add_argument('--emb-noise-decay-start-epoch', type=int, default=-1,
+                   help='Epoch after which to start decaying embedding noise (epoch > start). <0 defaults to --min-epochs (backward compatible).')
     p.add_argument('--crop-prob-pos', type=float, default=0.0, help='Probability to crop positives during training')
     p.add_argument('--crop-prob-un', type=float, default=0.0, help='Probability to crop unlabeled/negatives during training')
     p.add_argument('--crop-windows', type=str, default='', help='Comma-separated crop window lengths (e.g., 220,270,320,380)')
@@ -2091,6 +2117,8 @@ def parse_args() -> TrainConfig:
     p.add_argument('--scheduler', choices=['cosine','warm_restarts','plateau'], default='cosine',
                    help='Learning-rate scheduler to use')
     p.add_argument('--eta-min', type=float, default=1e-6, help='Minimum LR for cosine schedules')
+    p.add_argument('--cosine-tmax', type=int, default=0,
+                   help='CosineAnnealingLR T_max (0→use --epochs). If --epochs > T_max, LR is held at --eta-min after T_max.')
     p.add_argument('--t0', type=int, default=10, help='First cycle length for warm restarts')
     p.add_argument('--t-mult', type=float, default=2.0, help='Cycle multiplier for warm restarts')
     p.add_argument('--lr-patience', type=int, default=5, help='Plateau: epochs with no improvement before LR drop')
@@ -2142,6 +2170,7 @@ def parse_args() -> TrainConfig:
         emb_noise_std=args.emb_noise_std,
         emb_noise_warmup_epochs=args.emb_noise_warmup_epochs,
         emb_noise_decay_epochs=args.emb_noise_decay_epochs,
+        emb_noise_decay_start_epoch=args.emb_noise_decay_start_epoch,
         crop_prob_pos=args.crop_prob_pos,
         crop_prob_un=args.crop_prob_un,
         crop_windows=args.crop_windows,
@@ -2158,6 +2187,7 @@ def parse_args() -> TrainConfig:
         tau_len_ref=args.tau_len_ref,
         scheduler=args.scheduler,
         eta_min=args.eta_min,
+        cosine_tmax=args.cosine_tmax,
         t0=args.t0,
         t_mult=args.t_mult,
         lr_patience=args.lr_patience,
