@@ -16,7 +16,7 @@ def _strip_prefixes(sd, prefixes=('_orig_mod.', 'module.')):
 
 
 def _base_id(cid: str) -> str:
-    # handle both patterns from your pipelines
+    # Prefer the canonical |chunk_ format, with legacy _chunk_ accepted as fallback
     if "|chunk_" in cid:   # produced by your embedding script
         return cid.split("|chunk_")[0]
     if "_chunk_" in cid:   # legacy

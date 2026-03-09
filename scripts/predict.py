@@ -395,7 +395,11 @@ def load_ids_file(path: Optional[str]) -> Optional[List[str]]:
 
 
 def base_id_from_chunk(cid: str) -> str:
-    return cid.split('_chunk_')[0] if '_chunk_' in cid else cid
+    if '|chunk_' in cid:
+        return cid.split('|chunk_', 1)[0]
+    if '_chunk_' in cid:
+        return cid.split('_chunk_', 1)[0]
+    return cid
 
 def safe_key(s: str) -> str:
     """Safer HDF5 group key (avoid slashes)."""

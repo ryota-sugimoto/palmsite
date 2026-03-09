@@ -33,7 +33,7 @@ from torch.utils.data import DataLoader, Dataset
 # ----------------------------
 
 def base_id_from_chunk(cid: str) -> str:
-    # Support both legacy "_chunk_" and current "|chunk_" patterns
+    # Prefer the canonical "|chunk_" pattern, with legacy "_chunk_" accepted as fallback
     if "|chunk_" in cid:
         return cid.split("|chunk_")[0]
     if "_chunk_" in cid:

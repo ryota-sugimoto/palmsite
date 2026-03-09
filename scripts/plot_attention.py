@@ -19,7 +19,7 @@ chunk that actually defines the predicted span (matching GFF behavior).
 Expected JSON format (produced by predict.py with --attn-json):
 
 {
-  "base_chunk_0001_of_0002": {
+  "base|chunk_0001_of_0002|aa_000000_000400": {
     "L": 400,
     "orig_start": 0,
     "orig_len": 944,
@@ -31,7 +31,7 @@ Expected JSON format (produced by predict.py with --attn-json):
     "w": [...],
     "abs_pos": [...]
   },
-  "base_chunk_0002_of_0002": { ... },
+  "base|chunk_0002_of_0002|aa_000400_000800": { ... },
   ...
 }
 """
@@ -51,8 +51,12 @@ def load_json(path: str) -> Dict[str, Any]:
 
 
 def base_id_from_chunk(cid: str) -> str:
-    """Match predict.py: base_id is prefix before '_chunk_'."""
-    return cid.split("_chunk_")[0] if "_chunk_" in cid else cid
+    """Match predict.py: base_id is the prefix before the canonical '|chunk_' marker."""
+    if "|chunk_" in cid:
+        return cid.split("|chunk_", 1)[0]
+    if "_chunk_" in cid:
+        return cid.split("_chunk_", 1)[0]
+    return cid
 
 
 def group_by_base_id(data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -331,7 +335,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Base sequence ID to plot. If omitted, the base_id of the first JSON entry is used. "
-            "base_id is defined as the prefix before '_chunk_' in chunk_id."
+            "base_id is defined as the prefix before the canonical '|chunk_' marker in chunk_id."
         ),
     )
     p.add_argument(

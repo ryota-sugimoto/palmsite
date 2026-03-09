@@ -13,11 +13,11 @@ and ground-truth spans from a label TSV that uses chunk_ids, and visualize:
 Key assumptions (matches your labels_only_positives.tsv):
 - GFF seqid = parent sequence ID (e.g. "MGYP000911387321")
 - Label file has column "chunk_id" with format like:
-    "MGYP000911387321_chunk_0001_of_0001_aa_000000_000260"
-    "NP_041870.2_chunk_0002_of_0002_aa_001094_003094"
+    "MGYP000911387321|chunk_0001_of_0001|aa_000000_000260"
+    "NP_041870.2|chunk_0002_of_0002|aa_001094_003094"
 - span_start_aa / span_end_aa are CHUNK-LOCAL coordinates
   (for you: 1-based inclusive within the chunk).
-- The "_aa_SSSSSS_EEEEEE" suffix encodes the chunk's position in the parent
+- The canonical "|aa_SSSSSS_EEEEEE" suffix encodes the chunk's position in the parent
   as 0-based half-open indices [S, E), so E is the parent full length if
   this chunk is last in the sequence.
 - Optional ids_file contains chunk_ids or parent IDs; we map chunk_ids to
@@ -123,29 +123,38 @@ def iou(pred: List[Interval], truth: List[Interval]) -> float:
 # ID / coordinate helpers
 # ---------------------------------------------------------------------
 
-_CHUNK_RE = re.compile(
-    r'^(?P<parent>.+)_chunk_(?P<chunk>\d+)_of_(?P<total>\d+)_aa_(?P<s>\d{6})_(?P<e>\d{6})$'
-)
+_CHUNK_PATTERNS = [
+    re.compile(
+        r'^(?P<parent>.+?)\|chunk_(?P<chunk>\d+)_of_(?P<total>\d+)\|aa_(?P<s>\d{6})_(?P<e>\d{6})$'
+    ),
+    re.compile(
+        r'^(?P<parent>.+?)_chunk_(?P<chunk>\d+)_of_(?P<total>\d+)_aa_(?P<s>\d{6})_(?P<e>\d{6})$'
+    ),
+]
 
 
 def parse_chunk_id(chunk_id: str):
     """
     Parse a chunk_id like:
-      "NP_041870.2_chunk_0002_of_0002_aa_001094_003094"
+      "NP_041870.2|chunk_0002_of_0002|aa_001094_003094"
 
     Returns:
       parent_id, chunk_index, chunks_total, s_chunk, e_chunk
     where s_chunk/e_chunk are 0-based half-open indices in the parent.
+
+    The canonical format is '|chunk_...|aa_...'; legacy '_chunk_..._aa_...'
+    is accepted for backward compatibility.
     """
-    m = _CHUNK_RE.match(chunk_id)
-    if not m:
-        raise ValueError(f"chunk_id does not match expected pattern: {chunk_id}")
-    parent = m.group("parent")
-    chunk_index = int(m.group("chunk"))
-    chunks_total = int(m.group("total"))
-    s_chunk = int(m.group("s"))
-    e_chunk = int(m.group("e"))
-    return parent, chunk_index, chunks_total, s_chunk, e_chunk
+    for rx in _CHUNK_PATTERNS:
+        m = rx.match(chunk_id)
+        if m:
+            parent = m.group("parent")
+            chunk_index = int(m.group("chunk"))
+            chunks_total = int(m.group("total"))
+            s_chunk = int(m.group("s"))
+            e_chunk = int(m.group("e"))
+            return parent, chunk_index, chunks_total, s_chunk, e_chunk
+    raise ValueError(f"chunk_id does not match expected pattern: {chunk_id}")
 
 
 def parent_id_from_chunk(chunk_id: str) -> str:
@@ -262,7 +271,7 @@ def parse_label_truth_spans_parent(
 
     IMPORTANT:
       - span_start_aa/span_end_aa are CHUNK-LOCAL coordinates.
-      - Chunk offsets (0-based half-open) come from chunk_id suffix "_aa_SSSSSS_EEEEEE".
+      - Chunk offsets (0-based half-open) come from the canonical chunk_id suffix "|aa_SSSSSS_EEEEEE".
       - Full parent length is max(e_chunk) over all chunks for that parent.
     """
     pos_set = None

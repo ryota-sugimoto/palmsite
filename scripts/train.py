@@ -841,8 +841,17 @@ class TrainConfig:
     eval_out_json: str = 'eval_test.json'   # relative to out_dir unless absolute
     eval_out_ids: str = 'test_ids.txt'      # relative to out_dir unless absolute
 
+    # Optional minimum sequence-length filters (applied when split indices are built).
+    min_train_len: int = 0
+    min_eval_len: int = 0
+
 def base_id(cid: str) -> str:
-    return str(cid).split("_chunk_")[0]
+    cid = str(cid)
+    if "|chunk_" in cid:
+        return cid.split("|chunk_", 1)[0]
+    if "_chunk_" in cid:
+        return cid.split("_chunk_", 1)[0]
+    return cid
 
 
 def grouped_split(ids: np.ndarray, train_frac: float, val_frac: float, seed: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -870,6 +879,15 @@ def grouped_split(ids: np.ndarray, train_frac: float, val_frac: float, seed: int
     return idx_from(g_train), idx_from(g_val), idx_from(g_test)
 
 
+def filter_idx_by_min_len(idx: np.ndarray, lengths: np.ndarray, min_len: int) -> np.ndarray:
+    if min_len <= 0:
+        return idx
+    if idx.size == 0:
+        return idx
+    keep = lengths[idx] >= int(min_len)
+    return idx[keep]
+
+
 def build_datasets(cfg: TrainConfig) -> Tuple[RdRPDataset, RdRPDataset, RdRPDataset, int]:
     # Grouped split by base protein id to avoid leakage across chunks
     with h5py.File(cfg.labels, 'r') as h5l:
@@ -879,9 +897,36 @@ def build_datasets(cfg: TrainConfig) -> Tuple[RdRPDataset, RdRPDataset, RdRPData
         except Exception:
             tmp = g['chunk_id'][...]
             ids = np.array([t.decode('utf-8') if isinstance(t, (bytes, bytearray)) else str(t) for t in tmp], dtype=object)
+        lengths = g['L'][...].astype(np.int64)
     train_idx, val_idx, test_idx = grouped_split(ids, cfg.train_frac, cfg.val_frac, cfg.seed)
+
+    train_idx_raw = train_idx
+    val_idx_raw = val_idx
+    test_idx_raw = test_idx
+
+    train_idx = filter_idx_by_min_len(train_idx, lengths, cfg.min_train_len)
+    val_idx = filter_idx_by_min_len(val_idx, lengths, cfg.min_eval_len)
+    test_idx = filter_idx_by_min_len(test_idx, lengths, cfg.min_eval_len)
+
+    if train_idx.size == 0:
+        raise ValueError(
+            f"No training samples left after applying --min-train-len {cfg.min_train_len}."
+        )
+
+    if cfg.min_train_len > 0:
+        logging.info(
+            "Applied --min-train-len=%d: kept %d/%d training samples.",
+            int(cfg.min_train_len), int(train_idx.size), int(train_idx_raw.size)
+        )
+    if cfg.min_eval_len > 0:
+        logging.info(
+            "Applied --min-eval-len=%d: kept %d/%d val and %d/%d test samples.",
+            int(cfg.min_eval_len), int(val_idx.size), int(val_idx_raw.size), int(test_idx.size), int(test_idx_raw.size)
+        )
+
     # Probe d_model
-    tmp_ds = RdRPDataset(cfg.embeddings, cfg.labels, indices=np.array([0]), dtype=cfg.dataset_dtype)
+    probe_idx = np.array([int(train_idx[0])], dtype=np.int64)
+    tmp_ds = RdRPDataset(cfg.embeddings, cfg.labels, indices=probe_idx, dtype=cfg.dataset_dtype)
     d_model = tmp_ds._get_d_model()
     del tmp_ds
     # Parse crop windows
@@ -2032,6 +2077,10 @@ def parse_args() -> TrainConfig:
                    help='DataLoader prefetch_factor per worker (only when --num-workers > 0)')
     p.add_argument('--dataset-dtype', choices=['float16','float32'], default='float16',
                    help='Dtype for embeddings/pos channel coming from H5 (float16 is faster on GPU; use float32 for CPU).')
+    p.add_argument('--min-train-len', type=int, default=0,
+                   help='Exclude training samples shorter than this sequence length (0 disables filtering)')
+    p.add_argument('--min-eval-len', type=int, default=0,
+                   help='Exclude validation/test samples shorter than this sequence length (0 disables filtering)')
     p.add_argument('--seed', type=int, default=1337, help='Random seed for all RNGs')
     # Early stopping / AMP / calibration
     p.add_argument('--patience', type=int, default=5, help='Early stopping patience (epochs without selection gain)')
@@ -2153,6 +2202,8 @@ def parse_args() -> TrainConfig:
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         dataset_dtype=args.dataset_dtype,
+        min_train_len=args.min_train_len,
+        min_eval_len=args.min_eval_len,
         seed=args.seed,
         patience=args.patience,
         min_epochs=args.min_epochs,
