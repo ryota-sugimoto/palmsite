@@ -1577,15 +1577,16 @@ def train(cfg: TrainConfig) -> None:
     for epoch in range(1, cfg.epochs + 1):
         # Anneal wmin_base over first half (or --wmin-anneal-epochs)
         t = min(epoch - 1, wmin_anneal_E)
-        frac = t / max(wmin_anneal_E, 1)
-        model.wmin_base = wmin_start + (wmin_target - wmin_start) * frac
+        wmin_frac = t / max(wmin_anneal_E, 1)
+        model.wmin_base = wmin_start + (wmin_target - wmin_start) * wmin_frac
 
         # Optional PU-prior annealing
+        pu_frac = 1.0
         if cfg.pu_prior_anneal_epochs and cfg.pu_prior_end is not None:
             start = cfg.pu_prior if cfg.pu_prior_start is None else cfg.pu_prior_start
             t = min(epoch - 1, cfg.pu_prior_anneal_epochs)
-            frac = t / max(cfg.pu_prior_anneal_epochs, 1)
-            loss_pu.pi = float(start + (cfg.pu_prior_end - start) * frac)
+            pu_frac = t / max(cfg.pu_prior_anneal_epochs, 1)
+            loss_pu.pi = float(start + (cfg.pu_prior_end - start) * pu_frac)
 
         model.train()
         # Record the LR actually used during this epoch (before scheduler.step)
@@ -1598,16 +1599,25 @@ def train(cfg: TrainConfig) -> None:
         n_seen = 0
 
         # Noise warmup/decay
+        warm_frac = 1.0
         if cfg.emb_noise_warmup_epochs > 0:
-            warm = min(epoch / max(cfg.emb_noise_warmup_epochs, 1), 1.0)
-            sigma_epoch = float(cfg.emb_noise_std) * warm
+            warm_frac = min(epoch / max(cfg.emb_noise_warmup_epochs, 1), 1.0)
+            sigma_epoch = float(cfg.emb_noise_std) * warm_frac
         else:
             sigma_epoch = float(cfg.emb_noise_std)
         decay_start = int(cfg.emb_noise_decay_start_epoch) if int(getattr(cfg, 'emb_noise_decay_start_epoch', -1)) >= 0 else int(cfg.min_epochs)
+        noise_decay_frac = 0.0
+        noise_phase = 'plateau' if sigma_epoch > 0 else 'off'
+        if cfg.emb_noise_warmup_epochs > 0 and epoch <= cfg.emb_noise_warmup_epochs:
+            noise_phase = 'warmup'
         if cfg.emb_noise_decay_epochs > 0 and epoch > decay_start:
             tdec = max(0, epoch - decay_start)
-            fracd = min(tdec / max(cfg.emb_noise_decay_epochs, 1), 1.0)
-            sigma_epoch = sigma_epoch * (1.0 - fracd)
+            noise_decay_frac = min(tdec / max(cfg.emb_noise_decay_epochs, 1), 1.0)
+            sigma_epoch = sigma_epoch * (1.0 - noise_decay_frac)
+            noise_phase = 'decay' if noise_decay_frac < 1.0 else 'off'
+        if sigma_epoch <= 0.0:
+            sigma_epoch = 0.0
+            noise_phase = 'off'
 
         for batch in train_loader:
             x = batch['x'].to(device, non_blocking=True)
@@ -1713,10 +1723,22 @@ def train(cfg: TrainConfig) -> None:
             'epoch': epoch,
             'lr': lr_base_epoch,
             'lr_alpha': lr_alpha_epoch,
+            'scheduler': str(cfg.scheduler),
+            'cosine_tmax': int(cosine_tmax_eff) if cosine_tmax_eff is not None else None,
             'emb_noise_sigma': float(sigma_epoch),
+            'emb_noise_std': float(cfg.emb_noise_std),
+            'emb_noise_warmup_epochs': int(cfg.emb_noise_warmup_epochs),
+            'emb_noise_warm_frac': float(warm_frac),
             'emb_noise_decay_start': int(decay_start),
+            'emb_noise_decay_epochs': int(cfg.emb_noise_decay_epochs),
+            'emb_noise_decay_frac': float(noise_decay_frac),
+            'emb_noise_phase': str(noise_phase),
             'time_sec': round(train_time, 2),
             'wmin_base': float(getattr(model, 'wmin_base', cfg.wmin_base)),
+            'wmin_start': float(wmin_start),
+            'wmin_target': float(wmin_target),
+            'wmin_anneal_epochs': int(wmin_anneal_E),
+            'wmin_frac': float(wmin_frac),
             'train_loss': running['loss_total'],
             'train_loss_cls_pu': running['loss_cls_pu'],
             'train_loss_cls_clean': running['loss_cls_clean'],
@@ -1726,6 +1748,10 @@ def train(cfg: TrainConfig) -> None:
             'train_loss_alpha_prior': running['loss_alpha_prior'],
             'train_loss_contrast': running.get('loss_contrast', 0.0),
             'pi': float(loss_pu.pi),
+            'pu_prior_start': float(cfg.pu_prior if cfg.pu_prior_start is None else cfg.pu_prior_start),
+            'pu_prior_end': float(cfg.pu_prior_end) if cfg.pu_prior_end is not None else None,
+            'pu_prior_anneal_epochs': int(cfg.pu_prior_anneal_epochs),
+            'pu_prior_frac': float(pu_frac),
         }
         for k, v in val_losses.items():
             row[f'val_{k}'] = v
@@ -1737,7 +1763,12 @@ def train(cfg: TrainConfig) -> None:
         r_at_p95 = float(row.get('val_recall_at_precision_0.95_p_vs_rest', float('nan')))
         r_at_p99 = float(row.get('val_recall_at_precision_0.99_p_vs_rest', float('nan')))
         logging.info(
-            f"Epoch {epoch:03d} | lr={lr_base_epoch:.3e} | sigma={float(sigma_epoch):.4f} | pi={loss_pu.pi:.3f} | train={row['train_loss']:.4f} "
+            f"Epoch {epoch:03d} | lr={lr_base_epoch:.3e}/{lr_alpha_epoch:.3e} [{cfg.scheduler}] | "
+            f"noise={float(sigma_epoch):.4f} ({noise_phase}, warm={float(warm_frac):.2f}, decay={float(noise_decay_frac):.2f}, "
+            f"start={int(decay_start)}, dur={int(cfg.emb_noise_decay_epochs)}) | "
+            f"pi={loss_pu.pi:.3f} (frac={float(pu_frac):.2f}) | "
+            f"wmin={float(getattr(model, 'wmin_base', cfg.wmin_base)):.2f}->{wmin_target:.2f} (frac={float(wmin_frac):.2f}, E={int(wmin_anneal_E)}) | "
+            f"train={row['train_loss']:.4f} "
             f"(pu={row['train_loss_cls_pu']:.3f}, clean={row['train_loss_cls_clean']:.3f}, "
             f"span={row['train_loss_span']:.3f}, anchor={row['train_loss_anchor']:.3f}, "
             f"align={row['train_loss_align']:.3f}, a_prior={row['train_loss_alpha_prior']:.3f}, "
