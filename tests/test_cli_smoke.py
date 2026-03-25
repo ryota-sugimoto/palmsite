@@ -1,14 +1,18 @@
-# tests/test_cli_smoke.py
 from __future__ import annotations
 
-import io
-import os
+import sys
 from pathlib import Path
 
 import h5py
 import numpy as np
 import pytest
 from click.testing import CliRunner
+
+# Make the src/ layout importable when tests are run from the repository root.
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 # Import the CLI entrypoint
 from palmsite.cli import main as palmsite_cli
@@ -39,7 +43,7 @@ def _write_dummy_h5(h5_path: Path, base_id: str = "toy") -> None:
 
 
 @pytest.fixture
-def dummy_embed(monkeypatch, tmp_path):
+def dummy_embed(monkeypatch):
     """
     Replace the heavy embedder with a no-op that writes a tiny, valid HDF5 to the requested path.
     """
@@ -59,15 +63,25 @@ def dummy_predict(monkeypatch):
     Replace the heavy predictor with a tiny writer that emits one deterministic GFF row to the stream.
     """
 
-    # CLI calls: palmsite.infer_simple.predict_to_gff(embeddings_h5, backbone, model_id, revision, min_p, out_stream)
-    def _fake_predict(embeddings_h5: str, backbone: str, model_id, revision, min_p: float, out_stream):
+    # CLI calls: palmsite.infer_simple.predict_to_gff(..., out_stream=..., model_pt=..., write_header=..., return_attn=...)
+    def _fake_predict(
+        embeddings_h5: str,
+        backbone: str,
+        model_id,
+        revision,
+        min_p: float,
+        out_stream,
+        **kwargs,
+    ):
         # Confirm the H5 exists and has the expected minimal structure
         assert Path(embeddings_h5).exists(), "embeddings.h5 missing"
         with h5py.File(embeddings_h5, "r") as h5:
             assert "items" in h5
         # Emit a simple, valid GFF3 header + one feature above min_p
-        out_stream.write("##gff-version 3\n")
+        if kwargs.get("write_header", True):
+            out_stream.write("##gff-version 3\n")
         out_stream.write("toy\tPalmSite\tRdRP_domain\t3\t9\t0.900000\t.\t.\tID=toy;P=0.900000\n")
+        return {} if kwargs.get("return_attn") else None
 
     monkeypatch.setattr("palmsite.cli.predict_to_gff", _fake_predict)
     return _fake_predict
@@ -145,3 +159,57 @@ def test_short_and_long_flags_equivalence(tmp_path, dummy_embed, dummy_predict):
     assert r2.exit_code == 0, r2.output
     assert out1.exists() and out2.exists()
     assert out1.read_text() == out2.read_text()
+
+
+def test_local_model_pt_is_forwarded_to_predictor(tmp_path, dummy_embed, monkeypatch):
+    fa = tmp_path / "local_model.faa"
+    _write_fasta(fa, [("local", "M" * 14)])
+    local_ckpt = tmp_path / "debug_model.pt"
+    local_ckpt.write_bytes(b"placeholder checkpoint bytes")
+
+    seen: dict[str, object] = {}
+
+    def _fake_predict(
+        embeddings_h5: str,
+        backbone: str,
+        model_id,
+        revision,
+        min_p: float,
+        out_stream,
+        **kwargs,
+    ):
+        seen["embeddings_h5"] = embeddings_h5
+        seen["backbone"] = backbone
+        seen["model_id"] = model_id
+        seen["revision"] = revision
+        seen["model_pt"] = kwargs.get("model_pt")
+        out_stream.write("##gff-version 3\n")
+        out_stream.write("toy\tPalmSite\tRdRP_domain\t3\t9\t0.900000\t.\t.\tID=toy;P=0.900000\n")
+        return None
+
+    monkeypatch.setattr("palmsite.cli.predict_to_gff", _fake_predict)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        palmsite_cli,
+        ["--model-pt", str(local_ckpt), "--backbone", "600m", str(fa)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["model_pt"] == str(local_ckpt)
+    assert seen["backbone"] == "600m"
+    assert seen["model_id"] is None
+    assert seen["revision"] is None
+
+
+def test_local_model_pt_rejects_non_pt_files(tmp_path):
+    fa = tmp_path / "bad_model.faa"
+    _write_fasta(fa, [("bad", "M" * 14)])
+    bad_ckpt = tmp_path / "debug_model.bin"
+    bad_ckpt.write_bytes(b"placeholder bytes")
+
+    runner = CliRunner()
+    result = runner.invoke(palmsite_cli, ["--model-pt", str(bad_ckpt), str(fa)])
+
+    assert result.exit_code != 0
+    assert "Local PalmSite checkpoint must be a .pt file." in result.output

@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os, sys, csv, h5py, numpy as np, json
 from typing import Dict, Tuple, IO, Any, Optional
-from .hf import fetch_weights
+from .hf import resolve_weights_path
 
 
 def _strip_prefixes(sd, prefixes=('_orig_mod.', 'module.')):
@@ -33,23 +33,23 @@ def _d_model_from_h5(emb_h5: str) -> int:
 
 
 # Predictor cache: avoid re-loading the PalmSite checkpoint for every micro-batch.
-# Key: (backbone, model_id, revision, d_model, device_str)
-_PREDICTOR_CACHE: Dict[Tuple[str, Optional[str], Optional[str], int, str], Tuple[Any, str, float]] = {}
+# Key: (checkpoint_path, d_model, device_str)
+_PREDICTOR_CACHE: Dict[Tuple[str, int, str], Tuple[Any, str, float]] = {}
 
 def _get_predictor(backbone: str,
                    model_id: str | None,
                    revision: str | None,
+                   model_pt: str | None,
                    d_model: int,
                    device):
     """Return a cached (model, pos_channel, temperature) tuple."""
-    key = (str(backbone), model_id, revision, int(d_model), str(device))
+    ckpt_path = resolve_weights_path(backbone, model_id, revision, model_pt=model_pt)
+    key = (os.path.abspath(ckpt_path), int(d_model), str(device))
     if key in _PREDICTOR_CACHE:
         return _PREDICTOR_CACHE[key]
 
     import torch
     from ._predict_impl import RdRPModel
-
-    ckpt_path = fetch_weights(backbone, model_id, revision)
 
     # Load checkpoint (safe when available)
     try:
@@ -98,6 +98,7 @@ def predict_to_gff(
     out_stream: IO[str],
     attn_json: str | None = None,
     *,
+    model_pt: str | None = None,
     write_header: bool = True,
     return_attn: bool = False,
 ) -> Optional[Dict[str, Any]]:
@@ -106,6 +107,9 @@ def predict_to_gff(
 
     If attn_json is not None, also write a JSON file with per-chunk
     residue-wise attention details (same schema as predict.py/_predict_impl).
+
+    If ``model_pt`` is provided, that local checkpoint is used instead of
+    downloading PalmSite weights from Hugging Face.
 
     If return_attn is True, return that attention dictionary to the caller
     (useful for streaming / micro-batch aggregation).
@@ -126,7 +130,7 @@ def predict_to_gff(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     d_model = _d_model_from_h5(embeddings_h5)
-    model, pos_chan, T = _get_predictor(backbone, model_id, revision, d_model, device)
+    model, pos_chan, T = _get_predictor(backbone, model_id, revision, model_pt, d_model, device)
 
     ds = EmbOnlyDataset(embeddings_h5, ids=None, pos_channel=pos_chan)
     # Use single-process DataLoader to avoid forking after HuggingFace tokenizers initialization

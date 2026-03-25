@@ -150,6 +150,12 @@ class _AttnJSONWriter:
     help="Hugging Face model repo for PalmSite weights (default: PALMSITE_MODEL_ID or ryota-sugimoto/palmsite)",
 )
 @click.option(
+    "--model-pt", "--checkpoint", "model_pt",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Local PalmSite checkpoint (.pt). If set, this overrides --model-id/--revision and skips Hugging Face download.",
+)
+@click.option(
     "--revision", default=None, hidden=True,
     help="Optional HF model revision (or set PALMSITE_MODEL_REV)",
 )
@@ -194,6 +200,7 @@ def main(
     min_p,
     backbone,
     model_id,
+    model_pt,
     revision,
     device,
     token,
@@ -225,6 +232,19 @@ def main(
         log_level = "WARNING"
     else:
         log_level = "INFO"
+
+    if model_pt is not None and model_pt.suffix.lower() != ".pt":
+        click.echo("Local PalmSite checkpoint must be a .pt file.", err=True)
+        sys.exit(2)
+
+    if model_pt is not None:
+        if model_id is not None or revision is not None:
+            _log(
+                f"Using local PalmSite checkpoint: {model_pt} (ignoring --model-id/--revision)",
+                quiet=quiet,
+            )
+        else:
+            _log(f"Using local PalmSite checkpoint: {model_pt}", quiet=quiet)
 
     tmp_base = Path(tmp_dir) if tmp_dir else Path(tempfile.mkdtemp(prefix="palmsite_"))
     tmp_base.mkdir(parents=True, exist_ok=True)
@@ -320,6 +340,7 @@ def main(
                     model_id=model_id,
                     revision=revision,
                     min_p=float(min_p),
+                    model_pt=(str(model_pt) if model_pt is not None else None),
                     out_stream=stream,
                     attn_json=None,  # handled incrementally here
                     write_header=(not header_written),

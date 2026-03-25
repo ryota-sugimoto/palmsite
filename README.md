@@ -56,6 +56,9 @@ palmsite -p 0.9 examples/zikavirus_proteins.fasta
 
 # Use 6B (Forge)
 palmsite -b 6b -k <FORGE_TOKEN> examples/turnip-mosaic-virus_proteins.fasta
+
+# Use a local PalmSite checkpoint instead of Hugging Face weights
+palmsite --model-pt runs/debug/model_best.pt examples/hsrv_proteins.fasta
 ```
 
 Notes:
@@ -118,6 +121,7 @@ Usage: palmsite -p 0.5 [-o result.gff] [--attn-json details.json] <fasta ...>
   -p, --min-p FLOAT               Minimum probability for GFF [default: 0.5]
   -b, --backbone [300m|600m|6b]   Embedding backbone (local or Forge)
   -m, --model-id TEXT             HF model repo for PalmSite weights (default: ryota-sugimoto/palmsite)
+  --model-pt, --checkpoint PATH    Local PalmSite checkpoint (.pt); overrides HF download
   -d, --device [auto|cpu|cuda]    Device for local models (ignored for 6b)
   -k, --token TEXT                Forge token for 6B (or set ESM_FORGE_TOKEN)
   -t, --tmp-dir PATH              Temp directory (default: auto-created)
@@ -188,6 +192,8 @@ Contains one feature per protein:
 * `ESM_FORGE_TOKEN` — token for Forge when using `-b 6b`
 * `PALMSITE_MODEL_ID` — override default HF repo
 * `PALMSITE_MODEL_REV` — optional model revision
+
+When `--model-pt` is provided, PalmSite loads that local `.pt` checkpoint directly and does not download PalmSite weights from Hugging Face. The selected `--backbone` should still match the checkpoint you trained.
 
 ---
 
