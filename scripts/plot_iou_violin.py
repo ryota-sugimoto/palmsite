@@ -1,40 +1,40 @@
 #!/usr/bin/env python3
 """
-Compute per-parent-sequence IoU between PalmSite predicted spans (GFF3)
+Compute per-chunk IoU between PalmSite predicted spans (GFF3)
 and ground-truth spans from a label TSV that uses chunk_ids, and visualize:
 
 1) Distribution of IoU (violin / seaborn swarm / both)
 2) Scatter plots:
-   - IoU vs full sequence length
+   - IoU vs chunk length
    - IoU vs truth span length
    - IoU vs predicted span length
    - IoU vs predicted/true span length ratio
 
 Key assumptions (matches your labels_only_positives.tsv):
-- GFF seqid = parent sequence ID (e.g. "MGYP000911387321")
 - Label file has column "chunk_id" with format like:
     "MGYP000911387321|chunk_0001_of_0001|aa_000000_000260"
     "NP_041870.2|chunk_0002_of_0002|aa_001094_003094"
-- span_start_aa / span_end_aa are CHUNK-LOCAL coordinates
-  (for you: 1-based inclusive within the chunk).
-- The canonical "|aa_SSSSSS_EEEEEE" suffix encodes the chunk's position in the parent
-  as 0-based half-open indices [S, E), so E is the parent full length if
-  this chunk is last in the sequence.
-- Optional ids_file contains chunk_ids or parent IDs; we map chunk_ids to
-  parent IDs for filtering.
+- span_start_aa / span_end_aa are CHUNK-LOCAL coordinates.
+- GFF seqid is expected to be the chunk_id itself.
+- Predicted spans in the GFF are treated as chunk-local coordinates, just like
+  the label TSV spans.
+- Optional ids_file may contain chunk_ids and/or parent IDs:
+    * a chunk_id selects only that chunk
+    * a parent ID selects all chunks belonging to that parent
 
 Important behavior:
-- Only parents that have ground-truth spans AND are present in the GFF
-  are evaluated and plotted.
-- Others are skipped (counted in a summary message).
+- IoU is computed PER CHUNK, not per parent.
+- Only chunks that have ground-truth spans AND whose chunk_id exists in the GFF
+  are evaluated by default.
+- If a chunk exists in the GFF but has no predicted intervals, its IoU is 0.
 
 Outputs:
-- <out_prefix>.per_sequence_iou.csv       (LF line endings)
-- optional TSV via --per_sequence_tsv     (LF line endings)
-- <out_prefix>.iou_<plot_type>.png/.pdf   (IoU distribution)
-- <out_prefix>.iou_vs_full_len.png/.pdf   (IoU vs full seq len)
-- <out_prefix>.iou_vs_truth_len.png/.pdf  (IoU vs truth span len)
-- <out_prefix>.iou_vs_pred_len.png/.pdf   (IoU vs predicted span len)
+- <out_prefix>.per_chunk_iou.csv         (LF line endings)
+- optional TSV via --per_sequence_tsv    (LF line endings; kept for CLI compatibility)
+- <out_prefix>.iou_<plot_type>.png/.pdf  (IoU distribution)
+- <out_prefix>.iou_vs_chunk_len.png/.pdf (IoU vs chunk len)
+- <out_prefix>.iou_vs_truth_len.png/.pdf (IoU vs truth span len)
+- <out_prefix>.iou_vs_pred_len.png/.pdf  (IoU vs predicted span len)
 - <out_prefix>.iou_vs_span_ratio.png/.pdf (IoU vs pred/true ratio)
 """
 
@@ -42,6 +42,7 @@ import argparse
 import csv
 import gzip
 import re
+from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Set
 
 import matplotlib.pyplot as plt
@@ -55,6 +56,28 @@ except ImportError:
     HAVE_SCIPY = False
 
 Interval = Tuple[int, int]  # 1-based inclusive (start, end)
+
+
+@dataclass(frozen=True)
+class ChunkInfo:
+    chunk_id: str
+    parent_id: str
+    chunk_index: int
+    chunks_total: int
+    parent_start0: int  # 0-based inclusive start in parent
+    parent_end0: int    # 0-based exclusive end in parent
+
+    @property
+    def chunk_len(self) -> int:
+        return self.parent_end0 - self.parent_start0
+
+    @property
+    def parent_start1(self) -> int:
+        return self.parent_start0 + 1
+
+    @property
+    def parent_end1(self) -> int:
+        return self.parent_end0
 
 
 def smart_open(path: str, mode: str = "rt"):
@@ -133,34 +156,29 @@ _CHUNK_PATTERNS = [
 ]
 
 
-def parse_chunk_id(chunk_id: str):
+def parse_chunk_id(chunk_id: str) -> ChunkInfo:
     """
     Parse a chunk_id like:
       "NP_041870.2|chunk_0002_of_0002|aa_001094_003094"
 
-    Returns:
-      parent_id, chunk_index, chunks_total, s_chunk, e_chunk
-    where s_chunk/e_chunk are 0-based half-open indices in the parent.
-
-    The canonical format is '|chunk_...|aa_...'; legacy '_chunk_..._aa_...'
-    is accepted for backward compatibility.
+    Returns ChunkInfo with chunk coordinates represented on the parent as
+    0-based half-open [parent_start0, parent_end0).
     """
     for rx in _CHUNK_PATTERNS:
         m = rx.match(chunk_id)
         if m:
-            parent = m.group("parent")
-            chunk_index = int(m.group("chunk"))
-            chunks_total = int(m.group("total"))
-            s_chunk = int(m.group("s"))
-            e_chunk = int(m.group("e"))
-            return parent, chunk_index, chunks_total, s_chunk, e_chunk
+            return ChunkInfo(
+                chunk_id=chunk_id,
+                parent_id=m.group("parent"),
+                chunk_index=int(m.group("chunk")),
+                chunks_total=int(m.group("total")),
+                parent_start0=int(m.group("s")),
+                parent_end0=int(m.group("e")),
+            )
     raise ValueError(f"chunk_id does not match expected pattern: {chunk_id}")
 
 
 def parent_id_from_chunk(chunk_id: str) -> str:
-    """
-    Legacy helper: map a chunk_id to parent sequence ID without detailed parsing.
-    """
     if "|chunk_" in chunk_id:
         return chunk_id.split("|chunk_", 1)[0]
     if "_chunk_" in chunk_id:
@@ -168,25 +186,27 @@ def parent_id_from_chunk(chunk_id: str) -> str:
     return chunk_id
 
 
-def parse_id_list(ids_path: str) -> Set[str]:
+def parse_id_list(ids_path: str) -> Tuple[Set[str], Set[str]]:
     """
     Read an ID list file.
 
     Lines can contain chunk_ids or parent IDs.
-    We convert chunk_ids to parent IDs for filtering.
+    Returns:
+      (explicit_chunk_ids, explicit_parent_ids)
     """
-    out: Set[str] = set()
+    chunk_ids: Set[str] = set()
+    parent_ids: Set[str] = set()
     with smart_open(ids_path, "rt") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             try:
-                parent, *_ = parse_chunk_id(line)
+                info = parse_chunk_id(line)
+                chunk_ids.add(info.chunk_id)
             except ValueError:
-                parent = parent_id_from_chunk(line)
-            out.add(parent)
-    return out
+                parent_ids.add(parent_id_from_chunk(line))
+    return chunk_ids, parent_ids
 
 
 def coerce_int(x: str) -> Optional[int]:
@@ -231,7 +251,9 @@ def convert_coords_local_to_1based(start: int, end: int, coord_mode: str) -> Int
 
 def parse_gff_predictions(gff_path: str, feature_type: Optional[str] = None) -> Dict[str, List[Interval]]:
     """
-    GFF3 -> {seqid (parent): [ (start,end), ... ] }, using 1-based inclusive coords.
+    GFF3 -> {seqid: [(start, end), ...]}, using 1-based inclusive coords.
+
+    seqid is expected to be a chunk_id, and the spans are treated as chunk-local.
     """
     pred: Dict[str, List[Interval]] = {}
     with smart_open(gff_path, "rt") as f:
@@ -255,31 +277,26 @@ def parse_gff_predictions(gff_path: str, feature_type: Optional[str] = None) -> 
     return pred
 
 
-def parse_label_truth_spans_parent(
+def parse_label_truth_spans_by_chunk(
     label_tsv: str,
     require_use_span: bool = True,
     positive_labels: Optional[str] = None,
     coord_mode: str = "1based_inclusive",
-) -> Tuple[Dict[str, List[Interval]], Dict[str, int]]:
+) -> Tuple[Dict[str, List[Interval]], Dict[str, ChunkInfo]]:
     """
     Read label TSV (with chunk_id) and build:
 
-      truth: { parent_seqid: [ (start,end), ... ] } (merged per parent)
-      parent_len: { parent_seqid: full_sequence_length }
+      truth_by_chunk: {chunk_id: [(start, end), ...]}  # chunk-local, 1-based inclusive
+      chunk_info_by_id: {chunk_id: ChunkInfo}
 
     Assumes columns: chunk_id, label, use_span, span_start_aa, span_end_aa.
-
-    IMPORTANT:
-      - span_start_aa/span_end_aa are CHUNK-LOCAL coordinates.
-      - Chunk offsets (0-based half-open) come from the canonical chunk_id suffix "|aa_SSSSSS_EEEEEE".
-      - Full parent length is max(e_chunk) over all chunks for that parent.
     """
     pos_set = None
     if positive_labels:
         pos_set = {s.strip() for s in positive_labels.split(",") if s.strip()}
 
-    truth: Dict[str, List[Interval]] = {}
-    parent_len: Dict[str, int] = {}
+    truth_by_chunk: Dict[str, List[Interval]] = {}
+    chunk_info_by_id: Dict[str, ChunkInfo] = {}
 
     with smart_open(label_tsv, "rt") as f:
         reader = csv.DictReader(f, delimiter="\t")
@@ -293,14 +310,11 @@ def parse_label_truth_spans_parent(
 
         for row in reader:
             chunk_id_raw = row["chunk_id"].strip()
-            parent_id, chunk_idx, chunk_total, s_chunk, e_chunk = parse_chunk_id(chunk_id_raw)
-
-            # Track full parent length = max e_chunk (0-based half-open)
-            parent_len[parent_id] = max(parent_len.get(parent_id, 0), e_chunk)
+            info = parse_chunk_id(chunk_id_raw)
+            chunk_info_by_id[info.chunk_id] = info
 
             lab = row["label"].strip()
             use_span = coerce_int(row.get("use_span", ""))
-
             s0 = coerce_int(row.get("span_start_aa", ""))
             e0 = coerce_int(row.get("span_end_aa", ""))
 
@@ -311,25 +325,35 @@ def parse_label_truth_spans_parent(
             if s0 is None or e0 is None:
                 continue
 
-            # Convert chunk-local coords -> chunk 1-based inclusive
             loc_s, loc_e = convert_coords_local_to_1based(s0, e0, coord_mode)
 
-            # Map to parent 1-based inclusive:
-            # chunk covers parent positions [s_chunk, e_chunk) 0-based
-            # so parent 1-based start of chunk = s_chunk + 1
-            parent_s = s_chunk + loc_s
-            parent_e = s_chunk + loc_e
-            if parent_s > parent_e:
-                parent_s, parent_e = parent_e, parent_s
+            # Clamp to chunk bounds in case labels slightly exceed the chunk range.
+            if info.chunk_len <= 0:
+                continue
+            loc_s = max(1, min(loc_s, info.chunk_len))
+            loc_e = max(1, min(loc_e, info.chunk_len))
+            if loc_s > loc_e:
+                loc_s, loc_e = loc_e, loc_s
 
-            spans = truth.setdefault(parent_id, [])
-            spans.append((parent_s, parent_e))
+            truth_by_chunk.setdefault(info.chunk_id, []).append((loc_s, loc_e))
 
-    # Normalize (union) spans per parent
-    for parent_id, spans in list(truth.items()):
-        truth[parent_id] = normalize_intervals(spans)
+    for chunk_id, spans in list(truth_by_chunk.items()):
+        truth_by_chunk[chunk_id] = normalize_intervals(spans)
 
-    return truth, parent_len
+    return truth_by_chunk, chunk_info_by_id
+
+
+
+def get_chunk_prediction(pred_by_seqid: Dict[str, List[Interval]], info: ChunkInfo) -> Tuple[List[Interval], str]:
+    """
+    Return chunk-local predicted intervals and the source mode used.
+
+    Only direct chunk_id matches are accepted. No parent-coordinate projection
+    is performed.
+    """
+    if info.chunk_id in pred_by_seqid:
+        return normalize_intervals(pred_by_seqid[info.chunk_id]), "chunk"
+    return [], "missing"
 
 
 def intervals_to_str(intervals: List[Interval]) -> str:
@@ -429,8 +453,8 @@ def plot_both(values: List[float], title: str, subtitle: str):
     ax_s.set_title("Swarm", fontsize=8)
     ax_s.grid(True, axis="y", linestyle="--", linewidth=0.6, alpha=0.5)
 
-    fig.suptitle(title, fontsize=5)
-    fig.text(0.5, 0.02, subtitle, ha="center", va="bottom", fontsize=5)
+    fig.suptitle(title, fontsize=10)
+    fig.text(0.5, 0.02, subtitle, ha="center", va="bottom", fontsize=7)
     fig.tight_layout(rect=[0.03, 0.08, 0.97, 0.92])
     return fig, axes
 
@@ -440,7 +464,7 @@ def plot_scatter(x: np.ndarray, y: np.ndarray,
                  title: str, subtitle: str):
     fig, ax = plt.subplots(figsize=(5.6, 4.8))
     sns.set(style="whitegrid")
-    ax.scatter(x, y, alpha=0.7, edgecolors="none", s=1)
+    ax.scatter(x, y, alpha=0.7, edgecolors="none", s=8)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title, fontsize=8, pad=10)
@@ -457,30 +481,42 @@ def plot_scatter(x: np.ndarray, y: np.ndarray,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gff", required=True, help="PalmSite prediction GFF3 (.gz ok); seqid = parent sequence ID")
+    ap.add_argument("--gff", required=True, help="PalmSite prediction GFF3 (.gz ok); seqid may be chunk_id or parent sequence ID")
     ap.add_argument("--labels", required=True, help="Label TSV with chunk_id + span_start_aa/span_end_aa (.gz ok)")
     ap.add_argument("--out_prefix", default="figB", help="Output prefix for CSV and plots")
 
     ap.add_argument(
         "--per_sequence_tsv",
         default=None,
-        help="Optional path to write per-sequence IoU table as TSV "
-             "(if not set, only CSV is written).",
+        help="Optional path to write per-chunk IoU table as TSV "
+             "(argument name kept for backward CLI compatibility).",
     )
 
     ap.add_argument("--gff_feature_type", default=None,
                     help="Optional: only use GFF rows with this feature type (3rd column)")
 
     ap.add_argument("--ids_file", default=None,
-                    help="Optional: file with one chunk_id (or parent ID) per line; "
-                         "we map chunk_ids to parent IDs and evaluate only those parents")
+                    help="Optional: file with one chunk_id or parent ID per line; "
+                         "chunk_id keeps only that chunk, parent ID keeps all chunks from that parent")
+    ap.add_argument(
+        "--only_gff_sequences",
+        dest="only_gff_sequences",
+        action="store_true",
+        help="Only evaluate chunks whose chunk_id exists in the GFF seqids (default).",
+    )
+    ap.add_argument(
+        "--include_missing_gff_sequences",
+        dest="only_gff_sequences",
+        action="store_false",
+        help="Also evaluate label chunks absent from the GFF; these receive empty predictions and typically IoU=0.",
+    )
 
     ap.add_argument(
         "--coord_mode",
         choices=["1based_inclusive", "0based_inclusive", "0based_halfopen"],
         default="1based_inclusive",
         help="Coordinate system of span_start_aa/span_end_aa in label file "
-             "(chunk-local); converted to parent 1-based inclusive.",
+             "(chunk-local); normalized to chunk-local 1-based inclusive.",
     )
 
     ap.add_argument("--positive_labels", default=None,
@@ -489,7 +525,7 @@ def main():
                     help="Only evaluate rows with use_span != 0 (recommended for IoU)")
     ap.add_argument("--no_require_use_span", dest="require_use_span", action="store_false",
                     help="Evaluate even if use_span == 0 (not recommended)")
-    ap.set_defaults(require_use_span=True)
+    ap.set_defaults(require_use_span=True, only_gff_sequences=True)
 
     ap.add_argument("--iou_threshold", type=float, default=0.5,
                     help="IoU threshold to report %% IoU >= X")
@@ -503,53 +539,70 @@ def main():
 
     args = ap.parse_args()
 
-    # Parse predictions and truth
-    pred = parse_gff_predictions(args.gff, feature_type=args.gff_feature_type)
-    truth, parent_len = parse_label_truth_spans_parent(
+    pred_by_seqid = parse_gff_predictions(args.gff, feature_type=args.gff_feature_type)
+    truth_by_chunk, chunk_info_by_id = parse_label_truth_spans_by_chunk(
         args.labels,
         require_use_span=args.require_use_span,
         positive_labels=args.positive_labels,
         coord_mode=args.coord_mode,
     )
 
-    pred_parents = set(pred.keys())
-    truth_parents = set(truth.keys())
+    truth_chunk_ids = set(truth_by_chunk.keys())
 
-    # Optional filtering by ID list (ids_file contains chunk_ids or parent IDs)
     if args.ids_file:
-        keep_parents = parse_id_list(args.ids_file)
-        eval_ids = sorted(keep_parents & truth_parents & pred_parents)
-        skipped_missing_gff = len((truth_parents & keep_parents) - pred_parents)
+        keep_chunk_ids, keep_parent_ids = parse_id_list(args.ids_file)
+        eval_chunk_ids = sorted(
+            cid for cid in truth_chunk_ids
+            if (cid in keep_chunk_ids) or (chunk_info_by_id[cid].parent_id in keep_parent_ids)
+        )
     else:
-        eval_ids = sorted(truth_parents & pred_parents)
-        skipped_missing_gff = len(truth_parents - pred_parents)
+        eval_chunk_ids = sorted(truth_chunk_ids)
 
-    if not eval_ids:
+    n_filtered_not_in_gff = 0
+    if args.only_gff_sequences:
+        gff_seqids = set(pred_by_seqid.keys())
+        before = len(eval_chunk_ids)
+        eval_chunk_ids = [
+            cid for cid in eval_chunk_ids
+            if cid in gff_seqids
+        ]
+        n_filtered_not_in_gff = before - len(eval_chunk_ids)
+
+    if not eval_chunk_ids:
         raise SystemExit(
-            "No parent sequences to evaluate after filtering. "
+            "No chunks to evaluate after filtering. "
             "Check coord_mode / labels / ids_file / require_use_span / ID mapping."
         )
 
     rows = []
     vals: List[float] = []
-    full_lens: List[int] = []
+    chunk_lens: List[int] = []
     truth_lens: List[int] = []
     pred_lens: List[int] = []
     span_ratios: List[float] = []
 
-    n_no_pred = 0
+    n_no_prediction_source = 0
+    n_no_pred_intervals = 0
+    n_chunk_seqid_pred = 0
 
-    for pid in eval_ids:
-        p_ints = pred.get(pid, [])
-        t_ints = truth.get(pid, [])
+    for chunk_id in eval_chunk_ids:
+        info = chunk_info_by_id[chunk_id]
+        t_ints = truth_by_chunk[chunk_id]
+        p_ints, pred_mode = get_chunk_prediction(pred_by_seqid, info)
+
+        if pred_mode == "missing":
+            n_no_prediction_source += 1
+        elif pred_mode == "chunk":
+            n_chunk_seqid_pred += 1
+
         if not p_ints:
-            n_no_pred += 1
+            n_no_pred_intervals += 1
 
         v = iou(p_ints, t_ints)
         vals.append(v)
 
-        full_len = parent_len.get(pid, 0)
-        full_lens.append(full_len)
+        chunk_len = info.chunk_len
+        chunk_lens.append(chunk_len)
 
         t_len = intervals_length(t_ints)
         truth_lens.append(t_len)
@@ -557,18 +610,19 @@ def main():
         p_len = intervals_length(p_ints)
         pred_lens.append(p_len)
 
-        if t_len > 0:
-            span_ratio = p_len / t_len
-        else:
-            span_ratio = float("nan")
+        span_ratio = (p_len / t_len) if t_len > 0 else float("nan")
         span_ratios.append(span_ratio)
 
         rows.append({
-            "parent_seqid": pid,
-            "full_seq_len": str(full_len),
+            "chunk_id": chunk_id,
+            "parent_seqid": info.parent_id,
+            "chunk_index": str(info.chunk_index),
+            "chunks_total": str(info.chunks_total),
+            "chunk_len": str(chunk_len),
             "truth_span_len": str(t_len),
             "pred_span_len": str(p_len),
             "span_ratio": f"{span_ratio:.6f}" if np.isfinite(span_ratio) else "",
+            "pred_source": pred_mode,
             "pred_intervals": intervals_to_str(p_ints),
             "truth_intervals": intervals_to_str(t_ints),
             "iou": f"{v:.6f}",
@@ -577,23 +631,24 @@ def main():
     n = len(vals)
     ge = sum(1 for v in vals if v >= args.iou_threshold)
     pct_ge = 100.0 * ge / n
-    mean = sum(vals) / n
-    median = sorted(vals)[n // 2]
+    mean = float(np.mean(vals_arr := np.asarray(vals, dtype=float)))
+    median = float(np.median(vals_arr))
 
-    vals_arr = np.asarray(vals, dtype=float)
-    full_arr = np.asarray(full_lens, dtype=float)
+    chunk_arr = np.asarray(chunk_lens, dtype=float)
     truth_arr = np.asarray(truth_lens, dtype=float)
     pred_arr = np.asarray(pred_lens, dtype=float)
     ratio_arr = np.asarray(span_ratios, dtype=float)
 
-    # Filter out non-finite ratios for correlation
     ratio_mask = np.isfinite(ratio_arr)
     ratio_arr_valid = ratio_arr[ratio_mask]
     vals_ratio_valid = vals_arr[ratio_mask]
 
-    # Correlations with p-values
     def corr_with_p(x, y):
-        if HAVE_SCIPY and x.size >= 3:
+        if x.size < 2 or y.size < 2:
+            return float("nan"), float("nan"), float("nan"), float("nan")
+        if np.all(x == x[0]) or np.all(y == y[0]):
+            return float("nan"), float("nan"), float("nan"), float("nan")
+        if HAVE_SCIPY:
             r_p, p_p = stats.pearsonr(x, y)
             r_s, p_s = stats.spearmanr(x, y)
         else:
@@ -602,22 +657,25 @@ def main():
             p_p = p_s = float("nan")
         return r_p, p_p, r_s, p_s
 
-    r_full_p, p_full_p, r_full_s, p_full_s = corr_with_p(full_arr, vals_arr)
+    r_chunk_p, p_chunk_p, r_chunk_s, p_chunk_s = corr_with_p(chunk_arr, vals_arr)
     r_truth_p, p_truth_p, r_truth_s, p_truth_s = corr_with_p(truth_arr, vals_arr)
     r_pred_p, p_pred_p, r_pred_s, p_pred_s = corr_with_p(pred_arr, vals_arr)
     r_ratio_p, p_ratio_p, r_ratio_s, p_ratio_s = corr_with_p(ratio_arr_valid, vals_ratio_valid)
 
-    # CSV (always) with LF endings
-    out_csv = f"{args.out_prefix}.per_sequence_iou.csv"
+    out_csv = f"{args.out_prefix}.per_chunk_iou.csv"
     with open(out_csv, "w", newline="\n", encoding="utf-8") as f:
         w = csv.DictWriter(
             f,
             fieldnames=[
+                "chunk_id",
                 "parent_seqid",
-                "full_seq_len",
+                "chunk_index",
+                "chunks_total",
+                "chunk_len",
                 "truth_span_len",
                 "pred_span_len",
                 "span_ratio",
+                "pred_source",
                 "pred_intervals",
                 "truth_intervals",
                 "iou",
@@ -628,17 +686,20 @@ def main():
         for r in rows:
             w.writerow(r)
 
-    # Optional TSV
     if args.per_sequence_tsv:
         with open(args.per_sequence_tsv, "w", newline="\n", encoding="utf-8") as f:
             writer = csv.DictWriter(
                 f,
                 fieldnames=[
+                    "chunk_id",
                     "parent_seqid",
-                    "full_seq_len",
+                    "chunk_index",
+                    "chunks_total",
+                    "chunk_len",
                     "truth_span_len",
                     "pred_span_len",
                     "span_ratio",
+                    "pred_source",
                     "pred_intervals",
                     "truth_intervals",
                     "iou",
@@ -650,11 +711,10 @@ def main():
             for r in rows:
                 writer.writerow(r)
 
-    # IoU distribution
-    title = "PalmSite localization performance (IoU per parent sequence)"
+    title = "PalmSite localization performance (IoU per chunk)"
     subtitle = (
         f"n={n} | mean={mean:.3f} | median={median:.3f} | "
-        f"% IoU≥{args.iou_threshold:g} = {pct_ge:.1f}% | missing pred={n_no_pred}"
+        f"% IoU≥{args.iou_threshold:g} = {pct_ge:.1f}% | no pred intervals={n_no_pred_intervals}"
     )
 
     if args.plot_type == "violin":
@@ -684,26 +744,24 @@ def main():
         plt.close(fig)
         print("Wrote:", out_png, out_pdf)
 
-    # Scatter: IoU vs full sequence length
-    subtitle_full = (
-        f"Pearson r={r_full_p:.3f} (p={p_full_p:.1e}), "
-        f"Spearman ρ={r_full_s:.3f} (p={p_full_s:.1e}); n={n}"
+    subtitle_chunk = (
+        f"Pearson r={r_chunk_p:.3f} (p={p_chunk_p:.1e}), "
+        f"Spearman ρ={r_chunk_s:.3f} (p={p_chunk_s:.1e}); n={n}"
     )
     fig, _ = plot_scatter(
-        full_arr, vals_arr,
-        xlabel="Full sequence length (aa)",
+        chunk_arr, vals_arr,
+        xlabel="Chunk length (aa)",
         ylabel="IoU",
-        title="IoU vs full sequence length",
-        subtitle=subtitle_full,
+        title="IoU vs chunk length",
+        subtitle=subtitle_chunk,
     )
-    out_png_full = f"{args.out_prefix}.iou_vs_full_len.png"
-    out_pdf_full = f"{args.out_prefix}.iou_vs_full_len.pdf"
-    fig.savefig(out_png_full, dpi=300)
-    fig.savefig(out_pdf_full)
+    out_png_chunk = f"{args.out_prefix}.iou_vs_chunk_len.png"
+    out_pdf_chunk = f"{args.out_prefix}.iou_vs_chunk_len.pdf"
+    fig.savefig(out_png_chunk, dpi=300)
+    fig.savefig(out_pdf_chunk)
     plt.close(fig)
-    print("Wrote:", out_png_full, out_pdf_full)
+    print("Wrote:", out_png_chunk, out_pdf_chunk)
 
-    # Scatter: IoU vs truth span length
     subtitle_truth = (
         f"Pearson r={r_truth_p:.3f} (p={p_truth_p:.1e}), "
         f"Spearman ρ={r_truth_s:.3f} (p={p_truth_s:.1e}); n={n}"
@@ -722,7 +780,6 @@ def main():
     plt.close(fig)
     print("Wrote:", out_png_truth, out_pdf_truth)
 
-    # Scatter: IoU vs predicted span length
     subtitle_pred = (
         f"Pearson r={r_pred_p:.3f} (p={p_pred_p:.1e}), "
         f"Spearman ρ={r_pred_s:.3f} (p={p_pred_s:.1e}); n={n}"
@@ -741,7 +798,6 @@ def main():
     plt.close(fig)
     print("Wrote:", out_png_pred, out_pdf_pred)
 
-    # Scatter: IoU vs span_ratio (pred_len / truth_len)
     subtitle_ratio = (
         f"Pearson r={r_ratio_p:.3f} (p={p_ratio_p:.1e}), "
         f"Spearman ρ={r_ratio_s:.3f} (p={p_ratio_s:.1e}); n={ratio_arr_valid.size}"
@@ -763,12 +819,15 @@ def main():
     print("Wrote:", out_csv)
     if args.per_sequence_tsv:
         print("Wrote:", args.per_sequence_tsv)
-    print(f"Evaluated parent sequences (in GFF & labels): {n}")
-    print(f"Parents with ground truth but missing in GFF (skipped): {skipped_missing_gff}")
-    print(f"Parents present in GFF but with no predicted intervals: {n_no_pred}")
+    print(f"Evaluated chunks: {n}")
+    if args.only_gff_sequences:
+        print(f"Chunks filtered out because chunk_id did not exist in GFF: {n_filtered_not_in_gff}")
+    print(f"Chunks using direct chunk seqid predictions: {n_chunk_seqid_pred}")
+    print(f"Chunks with no matching prediction source: {n_no_prediction_source}")
+    print(f"Chunks with no predicted intervals after matching: {n_no_pred_intervals}")
     print(f"% IoU ≥ {args.iou_threshold:g}: {pct_ge:.2f}%")
-    print(f"Full length vs IoU:  Pearson r={r_full_p:.3f}, p={p_full_p:.3e}; "
-          f"Spearman ρ={r_full_s:.3f}, p={p_full_s:.3e}")
+    print(f"Chunk length vs IoU: Pearson r={r_chunk_p:.3f}, p={p_chunk_p:.3e}; "
+          f"Spearman ρ={r_chunk_s:.3f}, p={p_chunk_s:.3e}")
     print(f"Truth span vs IoU:   Pearson r={r_truth_p:.3f}, p={p_truth_p:.3e}; "
           f"Spearman ρ={r_truth_s:.3f}, p={p_truth_s:.3e}")
     print(f"Pred span vs IoU:    Pearson r={r_pred_p:.3f}, p={p_pred_p:.3e}; "

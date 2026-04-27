@@ -3,6 +3,12 @@
 Plot full-length final attention weights and Gaussian (from mu_attn, sigma_attn)
 for a base_id, aggregating over all chunks.
 
+New features:
+  - Attention curve color changed from blue to red.
+  - Optional palm_annot TSV parsing to overlay catalytic motifs A/B/C.
+  - Motifs are shown as translucent spans covering the motif sequence length,
+    plus a vertical line and a label at the motif start position.
+
 Aggregation strategy:
   - Attention (w): for each chunk, we add its attention weights w[pos_local]
     into a global full_w[pos_abs] (sum over chunks).
@@ -11,10 +17,6 @@ Aggregation strategy:
   - Then we optionally smooth full_w/full_g and normalize them by their
     total sum. For visualization, we rescale the Gaussian so its maximum
     matches the maximum of the attention curve, so it is clearly visible.
-
-This emphasizes residues that are consistently attended across overlapping chunks
-(e.g., a true catalytic palm), while showing the Gaussian only for the “winner”
-chunk that actually defines the predicted span (matching GFF behavior).
 
 Expected JSON format (produced by predict.py with --attn-json):
 
@@ -34,15 +36,38 @@ Expected JSON format (produced by predict.py with --attn-json):
   "base|chunk_0002_of_0002|aa_000400_000800": { ... },
   ...
 }
+
+Expected palm_annot TSV format (headerless, one sequence per line):
+
+seq_id<TAB>key=value<TAB>key=value<TAB>...
+
+Relevant keys (preferred / fallback):
+  - posA / posB / posC                : motif start positions (typically 1-based)
+  - seqA / seqB / seqC                : motif sequences
+  - motif_hmm_posA/B/C, pssm_posA/B/C : fallback positions
+  - motif_hmm_seqA/B/C, pssm_seqA/B/C : fallback sequences
 """
 
 import argparse
 import json
 import os
-from typing import Dict, Any, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib import transforms
+
+
+@dataclass(frozen=True)
+class MotifSpec:
+    label: str
+    start_1based: int
+    seq: str
+
+    @property
+    def length(self) -> int:
+        return max(len(self.seq), 1)
 
 
 def load_json(path: str) -> Dict[str, Any]:
@@ -91,7 +116,7 @@ def derive_span_from_mu_sigma(
     return S_idx, E_idx
 
 
-def choose_base_id(grouped: Dict[str, Dict[str, Any]], desired: str | None) -> str:
+def choose_base_id(grouped: Dict[str, Dict[str, Any]], desired: Optional[str]) -> str:
     if desired is not None:
         if desired not in grouped:
             raise KeyError(
@@ -123,7 +148,6 @@ def aggregate_full_length_for_base(
         span_abs : (abs_S, abs_E) predicted span (0-based, full-length)
         best_cid : chunk_id that produced the best span (highest P)
     """
-    # Determine orig_len as max over chunks
     orig_len = 0
     for cid, e in chunks.items():
         L = int(e["L"])
@@ -134,9 +158,8 @@ def aggregate_full_length_for_base(
         raise ValueError(f"Could not determine orig_len for base_id={base_id}")
 
     full_w = np.zeros(orig_len, dtype=float)
-    full_g = np.zeros(orig_len, dtype=float)  # will be filled only for best chunk
+    full_g = np.zeros(orig_len, dtype=float)
 
-    # First pass: aggregate w across all chunks and find best chunk (by P)
     best_P = -1.0
     best_span: Tuple[int, int] = (0, 0)
     best_cid = ""
@@ -144,19 +167,16 @@ def aggregate_full_length_for_base(
     for cid, e in chunks.items():
         L = int(e["L"])
         ostart = int(e["orig_start"])
-        olen = int(e.get("orig_len", orig_len))
 
         w = np.asarray(e["w"], dtype=float)
         if w.shape[0] != L:
             raise ValueError(f"Chunk {cid}: len(w)={w.shape[0]} != L={L}")
 
-        # Aggregate attention: sum over chunks
         for idx_local in range(L):
             pos_abs = ostart + idx_local
             if 0 <= pos_abs < orig_len:
                 full_w[pos_abs] += w[idx_local]
 
-        # Span / P for best-chunk selection
         mu_attn = float(e.get("mu_attn", e.get("mu", 0.0)))
         sigma_attn = float(e.get("sigma_attn", e.get("sigma", 0.0)))
         P = float(e.get("P", 0.0))
@@ -183,7 +203,6 @@ def aggregate_full_length_for_base(
             best_span = (abs_S, abs_E)
             best_cid = cid
 
-    # Second pass: compute Gaussian only for best chunk
     if best_cid:
         e = chunks[best_cid]
         L = int(e["L"])
@@ -228,6 +247,112 @@ def smooth_1d(arr: np.ndarray, k: int) -> np.ndarray:
     return np.convolve(padded, kernel, mode="valid")
 
 
+def _safe_int(value: Optional[str]) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def load_palm_annot_motifs(path: str) -> Dict[str, Dict[str, MotifSpec]]:
+    """
+    Parse palm_annot TSV into:
+      {seq_id: {'A': MotifSpec(...), 'B': ..., 'C': ...}}
+
+    The file is expected to be headerless and tab-delimited, where the first field
+    is seq_id and all remaining fields are key=value pairs.
+    """
+    motif_map: Dict[str, Dict[str, MotifSpec]] = {}
+
+    preferred_pos_keys = {
+        "A": ["posA", "motif_hmm_posA", "pssm_posA"],
+        "B": ["posB", "motif_hmm_posB", "pssm_posB"],
+        "C": ["posC", "motif_hmm_posC", "pssm_posC"],
+    }
+    preferred_seq_keys = {
+        "A": ["seqA", "motif_hmm_seqA", "pssm_seqA"],
+        "B": ["seqB", "motif_hmm_seqB", "pssm_seqB"],
+        "C": ["seqC", "motif_hmm_seqC", "pssm_seqC"],
+    }
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line_no, raw in enumerate(f, start=1):
+            line = raw.rstrip("\n")
+            if not line.strip():
+                continue
+            fields = line.split("\t")
+            seq_id = fields[0]
+            kv: Dict[str, str] = {}
+            for field in fields[1:]:
+                if "=" not in field:
+                    continue
+                key, value = field.split("=", 1)
+                kv[key] = value
+
+            per_seq: Dict[str, MotifSpec] = {}
+            for motif_label in ("A", "B", "C"):
+                pos = None
+                seq = ""
+                for key in preferred_pos_keys[motif_label]:
+                    pos = _safe_int(kv.get(key))
+                    if pos is not None:
+                        break
+                for key in preferred_seq_keys[motif_label]:
+                    seq = kv.get(key, "")
+                    if seq:
+                        break
+
+                if pos is None:
+                    continue
+                per_seq[motif_label] = MotifSpec(
+                    label=motif_label,
+                    start_1based=pos,
+                    seq=seq,
+                )
+
+            if per_seq:
+                motif_map[seq_id] = per_seq
+            else:
+                print(
+                    f"[warn] No motif A/B/C positions parsed from line {line_no} "
+                    f"for seq_id='{seq_id}'"
+                )
+
+    return motif_map
+
+
+def _motif_plot_coordinates(
+    motif: MotifSpec,
+    one_based: bool,
+    orig_len: int,
+) -> Tuple[float, float, float]:
+    """
+    Convert 1-based motif start to plotting coordinates.
+
+    Returns:
+      start_plot, end_plot, line_x
+    where end_plot is inclusive span end in the current axis coordinate system.
+    """
+    start_0based = motif.start_1based - 1
+    end_0based = start_0based + motif.length - 1
+
+    start_0based = max(0, min(start_0based, orig_len - 1))
+    end_0based = max(0, min(end_0based, orig_len - 1))
+
+    if one_based:
+        start_plot = start_0based + 1
+        end_plot = end_0based + 1
+        line_x = start_plot
+    else:
+        start_plot = start_0based
+        end_plot = end_0based
+        line_x = start_plot
+
+    return float(start_plot), float(end_plot), float(line_x)
+
+
 def plot_full_attention(
     base_id: str,
     full_w: np.ndarray,
@@ -236,6 +361,7 @@ def plot_full_attention(
     span_abs: Tuple[int, int],
     best_cid: str,
     out_path: str,
+    motifs: Optional[Dict[str, MotifSpec]] = None,
     one_based: bool = True,
     smooth_window: int = 1,
 ) -> None:
@@ -247,11 +373,9 @@ def plot_full_attention(
     x = np.arange(orig_len, dtype=float)
     x_plot = x + 1.0 if one_based else x
 
-    # Optional smoothing BEFORE normalization
     w = smooth_1d(full_w.copy(), smooth_window)
     g = smooth_1d(full_g.copy(), smooth_window)
 
-    # Normalize by total mass (each curve integrates to 1 before visual scaling)
     w_sum = float(w.sum()) if w.size > 0 else 1.0
     g_sum = float(g.sum()) if g.size > 0 else 1.0
     if w_sum > 0.0:
@@ -259,7 +383,6 @@ def plot_full_attention(
     if g_sum > 0.0:
         g /= g_sum
 
-    # For visualization, rescale Gaussian so its max matches attention's max
     w_max = float(w.max()) if w.size > 0 else 1.0
     g_max = float(g.max()) if g.size > 0 else 1.0
     if g_max > 0 and w_max > 0:
@@ -273,17 +396,17 @@ def plot_full_attention(
         S_plot = S_abs
         E_plot = E_abs
 
-    plt.figure(figsize=(10, 4))
+    fig, ax = plt.subplots(figsize=(10, 4.8))
 
-    plt.plot(
+    ax.plot(
         x_plot,
         w,
         label="Final attention (aggregated, mass-normalized)",
-        linewidth=1.5,
-        color="tab:blue",
+        linewidth=1.8,
+        color="tab:red",
     )
 
-    plt.plot(
+    ax.plot(
         x_plot,
         g,
         linestyle="--",
@@ -292,7 +415,7 @@ def plot_full_attention(
         color="tab:orange",
     )
 
-    plt.axvspan(
+    ax.axvspan(
         S_plot,
         E_plot,
         color="grey",
@@ -300,20 +423,65 @@ def plot_full_attention(
         label=f"Predicted catalytic span (best chunk: {best_cid})",
     )
 
+    if motifs:
+        motif_colors = {
+            "A": "#b2182b",
+            "B": "#7b3294",
+            "C": "#2166ac",
+        }
+        text_transform = transforms.blended_transform_factory(ax.transData, ax.transAxes)
+        label_y = {"A": 0.96, "B": 0.90, "C": 0.96}
+        for motif_label in ("A", "B", "C"):
+            motif = motifs.get(motif_label)
+            if motif is None:
+                continue
+            start_plot, end_plot, line_x = _motif_plot_coordinates(
+                motif=motif,
+                one_based=one_based,
+                orig_len=orig_len,
+            )
+            color = motif_colors[motif_label]
+            ax.axvspan(
+                start_plot,
+                end_plot,
+                color=color,
+                alpha=0.12,
+                linewidth=0,
+            )
+            ax.axvline(
+                line_x,
+                color=color,
+                linestyle=":",
+                linewidth=1.4,
+                label=f"Motif {motif_label} ({motif.start_1based})",
+            )
+            ax.text(
+                line_x,
+                label_y[motif_label],
+                f"{motif_label}:{motif.start_1based}",
+                transform=text_transform,
+                color=color,
+                rotation=90,
+                ha="center",
+                va="top",
+                fontsize=8,
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.65, "pad": 0.8},
+            )
+
     x_label = "Residue position (1-based)" if one_based else "Residue position (0-based)"
-    plt.xlabel(x_label)
-    plt.ylabel("Normalized weight")
-    plt.title(
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("Normalized weight")
+    ax.set_title(
         f"Full-length attention for {base_id}\n"
         f"(orig_len={orig_len}, best_chunk={best_cid}, smooth_window={smooth_window})"
     )
-    plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
-    plt.legend(fontsize=8, loc="upper right")
+    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+    ax.legend(fontsize=8, loc="upper left")
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=300)
-    plt.close()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
 
     print(
         f"[plot] Saved full-length attention plot for base_id='{base_id}' "
@@ -344,6 +512,14 @@ def parse_args() -> argparse.Namespace:
         help="Output image path (e.g. figs/attention_full.png).",
     )
     p.add_argument(
+        "--palm-annot",
+        default=None,
+        help=(
+            "Optional palm_annot TSV to overlay motif A/B/C positions. "
+            "The seq_id must match the selected base_id."
+        ),
+    )
+    p.add_argument(
         "--k-sigma",
         type=float,
         default=2.0,
@@ -369,7 +545,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def main():
+def main() -> None:
     args = parse_args()
     data = load_json(args.json)
     grouped = group_by_base_id(data)
@@ -382,6 +558,20 @@ def main():
         k_sigma=float(args.k_sigma),
     )
 
+    motifs = None
+    if args.palm_annot:
+        motif_map = load_palm_annot_motifs(args.palm_annot)
+        motifs = motif_map.get(base_id)
+        if motifs is None:
+            available = list(motif_map.keys())[:5]
+            print(
+                f"[warn] base_id '{base_id}' was not found in palm_annot TSV. "
+                f"Available examples: {available}"
+            )
+        else:
+            present = ", ".join(sorted(motifs.keys()))
+            print(f"[motif] Loaded motifs for {base_id}: {present}")
+
     plot_full_attention(
         base_id=base_id,
         full_w=full_w,
@@ -390,6 +580,7 @@ def main():
         span_abs=span_abs,
         best_cid=best_cid,
         out_path=args.out,
+        motifs=motifs,
         one_based=not args.zero_based,
         smooth_window=int(args.smooth_window),
     )
