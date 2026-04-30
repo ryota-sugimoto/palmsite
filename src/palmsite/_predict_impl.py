@@ -331,7 +331,182 @@ class RdRPModel(nn.Module):
             "mu": mu, "sigma": sigma, "alpha": alpha,
             "mu_attn": mu_attn, "sigma_attn": sigma_attn,
             "w": w,
+
+            # Internal representations for zero-shot analyses. H is the final
+            # PalmSite backbone layer after the task-specific MLP projection.
+            "H": H,
+            "w_anchor": w_anchor,
+            "c_anchor": c_anchor,
+            "c_gauss": c_gauss,
         }
+
+
+# ----------------------------
+# Pooling helper for zero-shot representation panels
+# ----------------------------
+
+def _l2_normalize_np(v: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """Return an L2-normalized float32 vector; leave near-zero vectors unchanged."""
+    v = np.asarray(v, dtype=np.float32)
+    n = float(np.linalg.norm(v))
+    if n <= eps:
+        return v.astype(np.float32, copy=False)
+    return (v / n).astype(np.float32, copy=False)
+
+
+def _mean_pool_np(mat: np.ndarray, *, l2_normalize: bool = True) -> Optional[List[float]]:
+    if mat is None or mat.size == 0 or mat.shape[0] == 0:
+        return None
+    v = np.asarray(mat, dtype=np.float32).mean(axis=0)
+    if l2_normalize:
+        v = _l2_normalize_np(v)
+    return v.astype(np.float32, copy=False).tolist()
+
+
+def _weighted_pool_np(mat: np.ndarray, weights: np.ndarray, *, l2_normalize: bool = True) -> Optional[List[float]]:
+    if mat is None or mat.size == 0 or mat.shape[0] == 0:
+        return None
+    mat = np.asarray(mat, dtype=np.float32)
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if w.shape[0] != mat.shape[0]:
+        raise ValueError(f"weights length {w.shape[0]} does not match matrix length {mat.shape[0]}")
+    denom = float(w.sum())
+    if denom <= 1e-12 or not np.isfinite(denom):
+        return _mean_pool_np(mat, l2_normalize=l2_normalize)
+    w = (w / denom).astype(np.float32, copy=False)
+    v = (mat * w[:, None]).sum(axis=0)
+    if l2_normalize:
+        v = _l2_normalize_np(v)
+    return v.astype(np.float32, copy=False).tolist()
+
+
+def _pool_panels_for_matrix(
+    mat: np.ndarray,
+    w: np.ndarray,
+    s_idx: int,
+    e_idx: int,
+    *,
+    top_k: int = 32,
+    l2_normalize: bool = True,
+) -> Tuple[Dict[str, Optional[List[float]]], Dict[str, Any]]:
+    """Compute comparable pooled vector panels for one token matrix."""
+    mat = np.asarray(mat, dtype=np.float32)
+    w = np.asarray(w, dtype=np.float64).reshape(-1)
+    L = int(mat.shape[0])
+    if L <= 0:
+        return {
+            "full_mean": None,
+            "full_attn_norm": None,
+            "span_mean": None,
+            "span_attn_norm": None,
+            "topk_attn_norm": None,
+            "nonspan_mean": None,
+        }, {"top_k_used": 0, "span_len": 0, "nonspan_len": 0}
+
+    if w.shape[0] != L:
+        raise ValueError(f"attention length {w.shape[0]} does not match matrix length {L}")
+
+    s = max(0, min(int(s_idx), L - 1))
+    e = max(0, min(int(e_idx), L - 1))
+    if e < s:
+        s, e = e, s
+
+    span_mask = np.zeros(L, dtype=bool)
+    span_mask[s:e + 1] = True
+    k = max(1, min(int(top_k), L)) if int(top_k) > 0 else min(1, L)
+    top_idx = np.argsort(-w, kind="mergesort")[:k]
+
+    panels = {
+        "full_mean": _mean_pool_np(mat, l2_normalize=l2_normalize),
+        "full_attn_norm": _weighted_pool_np(mat, w, l2_normalize=l2_normalize),
+        "span_mean": _mean_pool_np(mat[s:e + 1], l2_normalize=l2_normalize),
+        "span_attn_norm": _weighted_pool_np(mat[s:e + 1], w[s:e + 1], l2_normalize=l2_normalize),
+        "topk_attn_norm": _weighted_pool_np(mat[top_idx], w[top_idx], l2_normalize=l2_normalize),
+        "nonspan_mean": _mean_pool_np(mat[~span_mask], l2_normalize=l2_normalize),
+    }
+    meta = {
+        "span_local_start": int(s),
+        "span_local_end": int(e),
+        "span_len": int(e - s + 1),
+        "top_k_requested": int(top_k),
+        "top_k_used": int(k),
+        "top_k_local_indices": [int(x) for x in top_idx.tolist()],
+        "nonspan_len": int((~span_mask).sum()),
+    }
+    return panels, meta
+
+
+def compute_pool_panels(
+    H: np.ndarray,
+    w: np.ndarray,
+    s_idx: int,
+    e_idx: int,
+    *,
+    input_emb: Optional[np.ndarray] = None,
+    top_k: int = 32,
+    l2_normalize: bool = True,
+) -> Tuple[Dict[str, Dict[str, Optional[List[float]]]], Dict[str, Any]]:
+    """
+    Compute pooled representation panels for one PalmSite chunk.
+
+    Main recommended output for taxonomy/evolution tests:
+    pools["backbone"]["span_attn_norm"], the final PalmSite backbone H pooled
+    over the predicted catalytic span with final attention weights renormalized
+    inside that span.
+    """
+    H = np.asarray(H, dtype=np.float32)
+    w = np.asarray(w, dtype=np.float64).reshape(-1)
+    backbone_panels, base_meta = _pool_panels_for_matrix(
+        H, w, s_idx, e_idx, top_k=top_k, l2_normalize=l2_normalize
+    )
+    pools: Dict[str, Dict[str, Optional[List[float]]]] = {"backbone": backbone_panels}
+
+    meta: Dict[str, Any] = {
+        "schema": "palmsite_pooled_panels.v1",
+        "source": "final_palmSite_backbone_H",
+        "weight_type": "final_attention_w",
+        "l2_normalized": bool(l2_normalize),
+        "backbone_dim": int(H.shape[1]) if H.ndim == 2 else None,
+        **base_meta,
+    }
+
+    if input_emb is not None:
+        inp = np.asarray(input_emb, dtype=np.float32)
+        input_panels, _ = _pool_panels_for_matrix(
+            inp, w, s_idx, e_idx, top_k=top_k, l2_normalize=l2_normalize
+        )
+        pools["input"] = input_panels
+        meta["input_dim"] = int(inp.shape[1]) if inp.ndim == 2 else None
+        meta["input_controls"] = True
+    else:
+        meta["input_dim"] = None
+        meta["input_controls"] = False
+
+    return pools, meta
+
+
+def pooled_file_meta(*, top_k: int = 32, l2_normalize: bool = True, include_input: bool = False) -> Dict[str, Any]:
+    """Metadata block for compact pooled-panel JSON files."""
+    return {
+        "schema": "palmsite_pooled_panels.v1",
+        "description": "Compact per-chunk pooled vectors for zero-shot taxonomy/evolution comparisons.",
+        "primary_recommended_panel": "pools.backbone.span_attn_norm",
+        "panel_definitions": {
+            "full_mean": "Unweighted mean over all valid residues in the chunk.",
+            "full_attn_norm": "Final-attention weighted mean over all valid residues; weights renormalized over the full chunk.",
+            "span_mean": "Unweighted mean over the predicted catalytic span S_idx:E_idx.",
+            "span_attn_norm": "Final-attention weighted mean over S_idx:E_idx; weights renormalized within the span.",
+            "topk_attn_norm": "Final-attention weighted mean over the top-k attention residues; weights renormalized within top-k.",
+            "nonspan_mean": "Unweighted mean over residues outside the predicted catalytic span; null if no outside residues exist.",
+        },
+        "vector_source": "final PalmSite backbone H by default; optional input controls are original ESM-C token embeddings.",
+        "weight_type": "final_attention_w",
+        "top_k": int(top_k),
+        "l2_normalized": bool(l2_normalize),
+        "include_input_controls": bool(include_input),
+        "coordinates": "chunk-local 0-based inclusive for S_idx/E_idx; abs_pos/orig_start remain 0-based in JSON.",
+        "filtering_note": "For one vector per original sequence, keep entries where is_best_base_chunk is true.",
+    }
 
 
 # ----------------------------
@@ -460,8 +635,10 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
     # Aggregate best per base_id
     agg: Dict[str, Tuple[float, str, int, int, int, float, int, float, float, float]] = {}
 
-    # Optional per-residue attention JSON output
+    # Optional per-residue attention JSON output and compact pooled-vector JSON output
     attn_json: Optional[Dict[str, Any]] = {} if getattr(args, "attn_json", None) else None
+    pooled_json: Optional[Dict[str, Any]] = {} if getattr(args, "pooled_json", None) else None
+    want_pools = (pooled_json is not None) or bool(getattr(args, "include_pools_in_attn_json", False))
 
     with torch.no_grad():
         for b in dl:
@@ -485,6 +662,8 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
             mu_attn = out["mu_attn"].detach().cpu().numpy()
             sigma_attn = out["sigma_attn"].detach().cpu().numpy()
             w_full = out["w"].detach().cpu().numpy()  # (B, T)
+            H_full = out["H"].detach().float().cpu().numpy() if want_pools else None
+            input_full = x[:, :, :-1].detach().float().cpu().numpy() if (want_pools and getattr(args, "pool_include_input", False)) else None
 
             Lnp   = b["L"].detach().cpu().numpy().astype(int)
             S_idx = np.round(S * (Lnp - 1)).astype(int)
@@ -493,43 +672,88 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
             orig_start = b["orig_start"].detach().cpu().numpy().astype(int)
             orig_len   = b["orig_len"].detach().cpu().numpy().astype(int)
 
-            # Optional per-residue attention JSON storage (one object per chunk_id)
-            if attn_json is not None:
+            # Optional per-residue attention JSON and compact pooled panels
+            if (attn_json is not None) or (pooled_json is not None) or bool(getattr(args, "include_pools_in_attn_json", False)):
                 for i, cid in enumerate(b["chunk_ids"]):
                     Li = int(Lnp[i])
                     if Li <= 0:
                         continue
+                    bid = base_id_from_chunk(cid)
+                    s_local = max(0, min(int(S_idx[i]), Li - 1))
+                    e_local = max(0, min(int(E_idx[i]), Li - 1))
+                    if e_local < s_local:
+                        s_local, e_local = e_local, s_local
                     wi = w_full[i, :Li].astype(float, copy=False)
                     ostart = int(orig_start[i])
                     olen_i = int(orig_len[i])
                     abs_pos = (ostart + np.arange(Li, dtype=int)).tolist()
 
-                    attn_json[cid] = {
-                        "L": Li,
-                        "orig_start": ostart,
-                        "orig_len": olen_i,
+                    pools = None
+                    pool_meta = None
+                    if want_pools:
+                        inp_i = input_full[i, :Li] if input_full is not None else None
+                        pools, pool_meta = compute_pool_panels(
+                            H_full[i, :Li],
+                            wi,
+                            s_local,
+                            e_local,
+                            input_emb=inp_i,
+                            top_k=int(getattr(args, "pool_top_k", 32)),
+                            l2_normalize=not bool(getattr(args, "pool_no_l2", False)),
+                        )
 
-                        # anchor-based parameters
-                        "mu": float(mu[i]),
-                        "sigma": float(sigma[i]),
+                    if pooled_json is not None:
+                        pooled_json[cid] = {
+                            "chunk_id": cid,
+                            "base_id": bid,
+                            "L": Li,
+                            "orig_start": ostart,
+                            "orig_len": olen_i,
+                            "P": float(P[i]),
+                            "S_norm": float(S[i]),
+                            "E_norm": float(E[i]),
+                            "S_idx": int(s_local),
+                            "E_idx": int(e_local),
+                            "mu": float(mu[i]),
+                            "sigma": float(sigma[i]),
+                            "mu_attn": float(mu_attn[i]),
+                            "sigma_attn": float(sigma_attn[i]),
+                            "pools": pools,
+                            "pool_meta": pool_meta,
+                        }
 
-                        # final-attention-based parameters
-                        "mu_attn": float(mu_attn[i]),
-                        "sigma_attn": float(sigma_attn[i]),
+                    if attn_json is not None:
+                        attn_entry = {
+                            "L": Li,
+                            "base_id": bid,
+                            "orig_start": ostart,
+                            "orig_len": olen_i,
 
-                        # span information (matches what GFF uses)
-                        "S_norm": float(S[i]),
-                        "E_norm": float(E[i]),
-                        "S_idx": int(S_idx[i]),
-                        "E_idx": int(E_idx[i]),
+                            # anchor-based parameters
+                            "mu": float(mu[i]),
+                            "sigma": float(sigma[i]),
 
-                        # probability for convenience
-                        "P": float(P[i]),
+                            # final-attention-based parameters
+                            "mu_attn": float(mu_attn[i]),
+                            "sigma_attn": float(sigma_attn[i]),
 
-                        # per-residue final attention weights and positions
-                        "w": wi.tolist(),
-                        "abs_pos": abs_pos,
-                    }
+                            # span information (matches what GFF uses)
+                            "S_norm": float(S[i]),
+                            "E_norm": float(E[i]),
+                            "S_idx": int(s_local),
+                            "E_idx": int(e_local),
+
+                            # probability for convenience
+                            "P": float(P[i]),
+
+                            # per-residue final attention weights and positions
+                            "w": wi.tolist(),
+                            "abs_pos": abs_pos,
+                        }
+                        if bool(getattr(args, "include_pools_in_attn_json", False)) and pools is not None:
+                            attn_entry["pools"] = pools
+                            attn_entry["pool_meta"] = pool_meta
+                        attn_json[cid] = attn_entry
 
             for i, cid in enumerate(b["chunk_ids"]):
                 wcsv.writerow([cid, float(P[i]), float(S[i]), float(E[i]),
@@ -551,12 +775,37 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
 
     fcsv.close()
 
+    # Mark which chunk should be used for one-vector-per-original-sequence analyses.
+    best_chunk_by_base = {bid: vals[1] for bid, vals in agg.items()}
+    for obj in (attn_json, pooled_json):
+        if obj is None:
+            continue
+        for cid, rec in obj.items():
+            if isinstance(rec, dict):
+                bid = rec.get("base_id", base_id_from_chunk(cid))
+                rec["is_best_base_chunk"] = bool(cid == best_chunk_by_base.get(bid))
+
     # Write attention JSON to disk if requested
     if attn_json is not None and getattr(args, "attn_json", None):
         os.makedirs(os.path.dirname(args.attn_json) or ".", exist_ok=True)
         with open(args.attn_json, "w", encoding="utf-8") as fjson:
             json.dump(attn_json, fjson, indent=2)
         print(f"Wrote residue-wise attention weights to: {args.attn_json}")
+
+    # Write compact pooled panels JSON to disk if requested
+    if pooled_json is not None and getattr(args, "pooled_json", None):
+        os.makedirs(os.path.dirname(args.pooled_json) or ".", exist_ok=True)
+        payload = {
+            "_meta": pooled_file_meta(
+                top_k=int(getattr(args, "pool_top_k", 32)),
+                l2_normalize=not bool(getattr(args, "pool_no_l2", False)),
+                include_input=bool(getattr(args, "pool_include_input", False)),
+            )
+        }
+        payload.update(pooled_json)
+        with open(args.pooled_json, "w", encoding="utf-8") as fjson:
+            json.dump(payload, fjson, indent=2)
+        print(f"Wrote pooled representation panels to: {args.pooled_json}")
 
     # Base-level TSV
     if args.base_out:
@@ -639,6 +888,32 @@ def main():
         "--attn-json",
         default=None,
         help="Optional path to write residue-wise attention weights and mu/sigma per chunk as JSON.",
+    )
+    ap.add_argument(
+        "--pooled-json",
+        default=None,
+        help="Optional path to write compact pooled backbone vector panels for taxonomy/evolution analyses.",
+    )
+    ap.add_argument(
+        "--include-pools-in-attn-json",
+        action="store_true",
+        help="Also embed pooled vector panels inside each --attn-json entry.",
+    )
+    ap.add_argument(
+        "--pool-include-input",
+        action="store_true",
+        help="Also include original ESM-C input-embedding control panels in pooled JSON.",
+    )
+    ap.add_argument(
+        "--pool-top-k",
+        type=int,
+        default=32,
+        help="Number of highest-attention residues used for the top-k pooled panel.",
+    )
+    ap.add_argument(
+        "--pool-no-l2",
+        action="store_true",
+        help="Disable L2 normalization of pooled vectors.",
     )
 
     ap.add_argument("--window-scan", type=int, default=None)

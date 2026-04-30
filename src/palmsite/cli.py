@@ -130,6 +130,29 @@ class _AttnJSONWriter:
             self._fp = None
 
 
+def _pooled_file_meta_cli(*, top_k: int = 32, l2_normalize: bool = True, include_input: bool = False) -> Dict[str, Any]:
+    return {
+        "schema": "palmsite_pooled_panels.v1",
+        "description": "Compact per-chunk pooled vectors for zero-shot taxonomy/evolution comparisons.",
+        "primary_recommended_panel": "pools.backbone.span_attn_norm",
+        "panel_definitions": {
+            "full_mean": "Unweighted mean over all valid residues in the chunk.",
+            "full_attn_norm": "Final-attention weighted mean over all valid residues; weights renormalized over the full chunk.",
+            "span_mean": "Unweighted mean over the predicted catalytic span S_idx:E_idx.",
+            "span_attn_norm": "Final-attention weighted mean over S_idx:E_idx; weights renormalized within the span.",
+            "topk_attn_norm": "Final-attention weighted mean over the top-k attention residues; weights renormalized within top-k.",
+            "nonspan_mean": "Unweighted mean over residues outside the predicted catalytic span; null if no outside residues exist.",
+        },
+        "vector_source": "final PalmSite backbone H by default; optional input controls are original ESM-C token embeddings.",
+        "weight_type": "final_attention_w",
+        "top_k": int(top_k),
+        "l2_normalized": bool(l2_normalize),
+        "include_input_controls": bool(include_input),
+        "coordinates": "chunk-local 0-based inclusive for S_idx/E_idx; abs_pos/orig_start remain 0-based in JSON.",
+        "filtering_note": "For one vector per original sequence, keep entries where is_best_base_chunk is true.",
+    }
+
+
 @click.command(context_settings=dict(help_option_names=["-h", "--help"]))
 @click.version_option(__version__, prog_name="palmsite")
 @click.option(
@@ -187,6 +210,26 @@ class _AttnJSONWriter:
     help="Write per-residue attention + span details as JSON (can be large)",
 )
 @click.option(
+    "--pooled-json", default=None,
+    help="Write compact pooled backbone vector panels as JSON for taxonomy/evolution comparisons",
+)
+@click.option(
+    "--include-pools-in-attn-json", is_flag=True,
+    help="Also embed pooled vector panels inside each --attn-json entry",
+)
+@click.option(
+    "--pool-include-input", is_flag=True,
+    help="Also include matched original ESM-C input-embedding control panels in pooled JSON",
+)
+@click.option(
+    "--pool-top-k", default=32, show_default=True, type=int,
+    help="Number of highest-attention residues used for the top-k pooled panel",
+)
+@click.option(
+    "--pool-no-l2", is_flag=True,
+    help="Disable L2 normalization of pooled vectors",
+)
+@click.option(
     "--micro-batch-seqs", default=None, type=int,
     help="Process input in micro-batches of N sequences (bounds temp embedding size)",
 )
@@ -209,6 +252,11 @@ def main(
     verbose,
     keep_tmp,
     attn_json,
+    pooled_json,
+    include_pools_in_attn_json,
+    pool_include_input,
+    pool_top_k,
+    pool_no_l2,
     micro_batch_seqs,
     micro_batch_tokens,
     fastas,
@@ -285,6 +333,7 @@ def main(
 
     out_fp = None
     attn_writer: Optional[_AttnJSONWriter] = None
+    pool_writer: Optional[_AttnJSONWriter] = None
     try:
         # Prepare output stream
         if gff_out:
@@ -296,6 +345,17 @@ def main(
         # Prepare attention writer (incremental)
         if attn_json:
             attn_writer = _AttnJSONWriter(attn_json)
+
+        # Prepare compact pooled-vector writer (incremental).
+        if pooled_json:
+            pool_writer = _AttnJSONWriter(pooled_json)
+            pool_writer.write_dict({
+                "_meta": _pooled_file_meta_cli(
+                    top_k=int(pool_top_k),
+                    l2_normalize=not bool(pool_no_l2),
+                    include_input=bool(pool_include_input),
+                )
+            })
 
         header_written = False
         n_batches = 0
@@ -334,7 +394,8 @@ def main(
 
             # Predict and stream GFF
             try:
-                attn_obj = predict_to_gff(
+                want_artifacts = bool(pool_writer)
+                result = predict_to_gff(
                     embeddings_h5=str(batch_h5),
                     backbone=backbone,
                     model_id=model_id,
@@ -345,10 +406,27 @@ def main(
                     attn_json=None,  # handled incrementally here
                     write_header=(not header_written),
                     return_attn=bool(attn_writer),
+                    pooled_json=None,  # handled incrementally here
+                    include_pools_in_attn_json=bool(include_pools_in_attn_json),
+                    pool_include_input=bool(pool_include_input),
+                    pool_top_k=int(pool_top_k),
+                    pool_l2_normalize=not bool(pool_no_l2),
+                    return_artifacts=want_artifacts,
                 )
                 header_written = True
+
+                if want_artifacts:
+                    artifacts = result or {}
+                    attn_obj = artifacts.get("attn", {}) if isinstance(artifacts, dict) else {}
+                    pooled_obj = artifacts.get("pooled", {}) if isinstance(artifacts, dict) else {}
+                else:
+                    attn_obj = result or {}
+                    pooled_obj = {}
+
                 if attn_writer and attn_obj:
                     attn_writer.write_dict(attn_obj)
+                if pool_writer and pooled_obj:
+                    pool_writer.write_dict(pooled_obj)
             except Exception as e:
                 click.echo(f"Inference failed (batch {n_batches}): {e}", err=True)
                 sys.exit(2)
@@ -369,6 +447,8 @@ def main(
     finally:
         if attn_writer:
             attn_writer.close()
+        if pool_writer:
+            pool_writer.close()
         if out_fp:
             out_fp.close()
         if (not tmp_dir) and (not keep_tmp):

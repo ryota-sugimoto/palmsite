@@ -17,6 +17,12 @@ As of **v0.2.0**, PalmSite can also optionally output **per-residue attention we
   ```bash
   palmsite --attn-json details.json <fasta>
   ```
+
+* **New:** compact pooled internal-backbone vectors for zero-shot analysis:
+
+  ```bash
+  palmsite --pooled-json pooled_panels.json <fasta>
+  ```
 * **High precision and recall AUC** (internal benchmarks):
 
 | Backbone (ESM-C) | Positives vs. Negatives | Positives vs. Rest |
@@ -104,6 +110,74 @@ Each entry corresponds to one **embedded chunk** and includes:
 
 ---
 
+## **NEW: Pooled backbone panels for zero-shot test**
+
+PalmSite can now export compact per-chunk pooled vectors from the **final PalmSite backbone layer** `H` rather than from the raw input embedding. The main recommended representation is:
+
+```text
+pools.backbone.span_attn_norm
+```
+
+This vector is the final backbone embedding averaged over the predicted catalytic span `S_idx:E_idx`, using final attention weights renormalized inside that span, then L2-normalized by default.
+
+```bash
+palmsite \
+  -o result.gff \
+  --attn-json attention_details.json \
+  --pooled-json pooled_panels.json \
+  examples/myproteins.fasta
+```
+
+For each chunk, `pooled_panels.json` contains:
+
+```json
+{
+  "chunk_id": {
+    "base_id": "original_sequence_id",
+    "is_best_base_chunk": true,
+    "P": 0.99,
+    "S_idx": 100,
+    "E_idx": 180,
+    "pools": {
+      "backbone": {
+        "full_mean": [...],
+        "full_attn_norm": [...],
+        "span_mean": [...],
+        "span_attn_norm": [...],
+        "topk_attn_norm": [...],
+        "nonspan_mean": [...]
+      }
+    },
+    "pool_meta": {
+      "schema": "palmsite_pooled_panels.v1",
+      "backbone_dim": 256,
+      "l2_normalized": true
+    }
+  }
+}
+```
+
+Useful options:
+
+```bash
+# Also embed the same vectors inside each attention JSON entry
+palmsite --attn-json attention.json --include-pools-in-attn-json <fasta>
+
+# Add raw ESM-C input-embedding control panels; this makes JSON much larger
+palmsite --pooled-json pooled.json --pool-include-input <fasta>
+
+# Change the top-k panel size or disable L2 normalization
+palmsite --pooled-json pooled.json --pool-top-k 64 --pool-no-l2 <fasta>
+```
+
+For one vector per original protein in downstream clustering, keep only records with:
+
+```text
+is_best_base_chunk == true
+```
+
+---
+
 ## **Command-line usage**
 
 ```
@@ -129,6 +203,11 @@ Usage: palmsite -p 0.5 [-o result.gff] [--attn-json details.json] <fasta ...>
   -v, --verbose                   Debug logs (overrides quiet)
   --keep-tmp                      Keep temp files (sanitized FASTA + per-batch embeddings)
   --attn-json PATH                Write per-residue attention JSON (can be large)
+  --pooled-json PATH              Write compact pooled backbone vector panels
+  --include-pools-in-attn-json    Embed pooled panels inside each attention JSON entry
+  --pool-include-input            Also include raw ESM-C input-embedding control panels
+  --pool-top-k INTEGER            Number of residues for top-k attention panel [default: 32]
+  --pool-no-l2                    Disable L2 normalization of pooled vectors
   --micro-batch-seqs INTEGER      Micro-batch size in number of sequences
   --micro-batch-tokens INTEGER    Micro-batch size cap in ~tokens (sum(len(seq)+2))
   FASTAS...                       One or more FASTA files
@@ -166,7 +245,8 @@ Prediction code lives in:
 Outputs include:
 
 * **GFF3** spans
-* **(New) JSON** with attention maps
+* **JSON** with attention maps
+* **Pooled final-backbone vector panels** for clustering/taxonomy comparisons
 
 ---
 

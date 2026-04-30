@@ -101,25 +101,29 @@ def predict_to_gff(
     model_pt: str | None = None,
     write_header: bool = True,
     return_attn: bool = False,
+    pooled_json: str | None = None,
+    include_pools_in_attn_json: bool = False,
+    pool_include_input: bool = False,
+    pool_top_k: int = 32,
+    pool_l2_normalize: bool = True,
+    return_artifacts: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Run PalmSite on an embeddings.h5 file and write GFF3 to out_stream.
 
     If attn_json is not None, also write a JSON file with per-chunk
-    residue-wise attention details (same schema as predict.py/_predict_impl).
+    residue-wise attention details. If pooled_json is provided, write compact
+    pooled vectors for zero-shot taxonomy/evolution analyses. The recommended
+    panel is pools.backbone.span_attn_norm.
 
-    If ``model_pt`` is provided, that local checkpoint is used instead of
-    downloading PalmSite weights from Hugging Face.
-
-    If return_attn is True, return that attention dictionary to the caller
-    (useful for streaming / micro-batch aggregation).
+    If return_artifacts is True, return {"attn": ..., "pooled": ...}; this is
+    used by the streaming CLI to write JSON incrementally.
     """
     try:
         import torch
         from torch.utils.data import DataLoader
-        # Import engine only now (it imports torch at module level)
         from ._predict_impl import (
-            EmbOnlyDataset, collate
+            EmbOnlyDataset, collate, compute_pool_panels, pooled_file_meta
         )
     except ImportError as e:
         raise RuntimeError(
@@ -133,17 +137,15 @@ def predict_to_gff(
     model, pos_chan, T = _get_predictor(backbone, model_id, revision, model_pt, d_model, device)
 
     ds = EmbOnlyDataset(embeddings_h5, ids=None, pos_channel=pos_chan)
-    # Use single-process DataLoader to avoid forking after HuggingFace tokenizers initialization
-    # (which can emit warnings and, in rare cases, lead to deadlocks).
     pin = bool(device.type == "cuda")
     dl = DataLoader(ds, batch_size=64, shuffle=False, num_workers=0, pin_memory=pin, collate_fn=collate)
 
-    # Aggregate best per original sequence
     best: Dict[str, Tuple[float, str, int, int, int, float, int]] = {}
 
-    # Optional per-chunk residue-wise attention JSON
-    want_attn = (attn_json is not None) or bool(return_attn)
+    want_pools = (pooled_json is not None) or bool(return_artifacts) or bool(include_pools_in_attn_json)
+    want_attn = (attn_json is not None) or bool(return_attn) or (bool(include_pools_in_attn_json) and want_pools)
     attn_obj: Optional[Dict[str, Any]] = {} if want_attn else None
+    pool_obj: Optional[Dict[str, Any]] = {} if want_pools else None
 
     if write_header:
         out_stream.write("##gff-version 3\n")
@@ -163,22 +165,33 @@ def predict_to_gff(
             mu_attn = o["mu_attn"].cpu().numpy()
             sigma_attn = o["sigma_attn"].cpu().numpy()
             w_full = o["w"].cpu().numpy()
+            H_full = o["H"].detach().float().cpu().numpy() if want_pools else None
+            input_full = x[:, :, :-1].detach().float().cpu().numpy() if (want_pools and pool_include_input) else None
 
             Lnp = b["L"].cpu().numpy().astype(int)
             S_idx = np.round(S * (Lnp - 1)).astype(int)
             E_idx = np.round(E * (Lnp - 1)).astype(int)
             mu_idx = np.round(mu * (Lnp - 1)).astype(int)
             orig_start = b["orig_start"].cpu().numpy().astype(int)
-            orig_len   = b["orig_len"].cpu().numpy().astype(int)
+            orig_len = b["orig_len"].cpu().numpy().astype(int)
 
             for i, cid in enumerate(b["chunk_ids"]):
-                # Absolute coords on original protein (1-based in GFF)
-                aS = int(orig_start[i] + S_idx[i]) + 1
-                aE = int(orig_start[i] + E_idx[i]) + 1
-                if aE < aS:
-                    aS, aE = aE, aS
+                Li = int(Lnp[i])
+                if Li <= 0:
+                    continue
+
                 bid = _base_id(cid)
                 pi = float(P[i])
+
+                s_local = max(0, min(int(S_idx[i]), Li - 1))
+                e_local = max(0, min(int(E_idx[i]), Li - 1))
+                if e_local < s_local:
+                    s_local, e_local = e_local, s_local
+
+                aS = int(orig_start[i] + s_local) + 1
+                aE = int(orig_start[i] + e_local) + 1
+                if aE < aS:
+                    aS, aE = aE, aS
 
                 if (bid not in best) or (pi > best[bid][0]):
                     best[bid] = (
@@ -191,38 +204,75 @@ def predict_to_gff(
                         int(orig_len[i]),
                     )
 
-                # Optional per-chunk attention JSON (same schema as predict.py/_predict_impl)
+                wi = w_full[i, :Li].astype(float, copy=False)
+                ostart = int(orig_start[i])
+                olen_i = int(orig_len[i])
+                abs_pos = (ostart + np.arange(Li, dtype=int)).tolist()
+
+                pools = None
+                pool_meta = None
+                if pool_obj is not None:
+                    inp_i = input_full[i, :Li] if input_full is not None else None
+                    pools, pool_meta = compute_pool_panels(
+                        H_full[i, :Li],
+                        wi,
+                        s_local,
+                        e_local,
+                        input_emb=inp_i,
+                        top_k=int(pool_top_k),
+                        l2_normalize=bool(pool_l2_normalize),
+                    )
+                    pool_obj[cid] = {
+                        "chunk_id": cid,
+                        "base_id": bid,
+                        "L": Li,
+                        "orig_start": ostart,
+                        "orig_len": olen_i,
+                        "P": pi,
+                        "S_norm": float(S[i]),
+                        "E_norm": float(E[i]),
+                        "S_idx": int(s_local),
+                        "E_idx": int(e_local),
+                        "mu": float(mu[i]),
+                        "sigma": float(sigma[i]),
+                        "mu_attn": float(mu_attn[i]),
+                        "sigma_attn": float(sigma_attn[i]),
+                        "pools": pools,
+                        "pool_meta": pool_meta,
+                    }
+
                 if attn_obj is not None:
-                    Li = int(Lnp[i])
-                    if Li > 0:
-                        wi = w_full[i, :Li].astype(float, copy=False)
-                        ostart = int(orig_start[i])
-                        olen_i = int(orig_len[i])
-                        abs_pos = (ostart + np.arange(Li, dtype=int)).tolist()
+                    attn_entry = {
+                        "L": Li,
+                        "base_id": bid,
+                        "orig_start": ostart,
+                        "orig_len": olen_i,
+                        "mu": float(mu[i]),
+                        "sigma": float(sigma[i]),
+                        "mu_attn": float(mu_attn[i]),
+                        "sigma_attn": float(sigma_attn[i]),
+                        "S_norm": float(S[i]),
+                        "E_norm": float(E[i]),
+                        "S_idx": int(s_local),
+                        "E_idx": int(e_local),
+                        "P": pi,
+                        "w": wi.tolist(),
+                        "abs_pos": abs_pos,
+                    }
+                    if include_pools_in_attn_json and pools is not None:
+                        attn_entry["pools"] = pools
+                        attn_entry["pool_meta"] = pool_meta
+                    attn_obj[cid] = attn_entry
 
-                        attn_obj[cid] = {
-                            "L": Li,
-                            "orig_start": ostart,
-                            "orig_len": olen_i,
-                            # anchor-based parameters
-                            "mu": float(mu[i]),
-                            "sigma": float(sigma[i]),
-                            # final-attention-based parameters
-                            "mu_attn": float(mu_attn[i]),
-                            "sigma_attn": float(sigma_attn[i]),
-                            # span info (normalized + indices)
-                            "S_norm": float(S[i]),
-                            "E_norm": float(E[i]),
-                            "S_idx": int(S_idx[i]),
-                            "E_idx": int(E_idx[i]),
-                            # probability
-                            "P": float(P[i]),
-                            # per-residue attention + absolute positions
-                            "w": wi.tolist(),
-                            "abs_pos": abs_pos,
-                        }
+    best_chunk_by_base = {bid: vals[1] for bid, vals in best.items()}
+    for obj in (attn_obj, pool_obj):
+        if obj is None:
+            continue
+        for cid, rec in obj.items():
+            if isinstance(rec, dict):
+                bid = rec.get("base_id", _base_id(cid))
+                rec["is_best_base_chunk"] = bool(cid == best_chunk_by_base.get(bid))
 
-    # Emit GFF rows with min-p filter
     n = 0
     for bid, (Pmax, cid, aS, aE, aMu, sig, Lorig) in best.items():
         if Pmax < float(min_p):
@@ -243,13 +293,27 @@ def predict_to_gff(
     if out_stream is not sys.stdout:
         out_stream.flush()
 
-    # Write attention JSON if requested
     if attn_obj is not None and attn_json is not None:
         os.makedirs(os.path.dirname(attn_json) or ".", exist_ok=True)
         with open(attn_json, "w", encoding="utf-8") as fjson:
             json.dump(attn_obj, fjson, indent=2)
 
+    if pool_obj is not None and pooled_json is not None:
+        os.makedirs(os.path.dirname(pooled_json) or ".", exist_ok=True)
+        payload = {
+            "_meta": pooled_file_meta(
+                top_k=int(pool_top_k),
+                l2_normalize=bool(pool_l2_normalize),
+                include_input=bool(pool_include_input),
+            )
+        }
+        payload.update(pool_obj)
+        with open(pooled_json, "w", encoding="utf-8") as fjson:
+            json.dump(payload, fjson, indent=2)
+
+    if return_artifacts:
+        return {"attn": attn_obj or {}, "pooled": pool_obj or {}}
+
     if return_attn:
-        # Always return a dict for caller convenience
         return attn_obj or {}
     return None

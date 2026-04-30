@@ -28,6 +28,7 @@ Everything else mirrors training:
 """
 from __future__ import annotations
 import os
+import sys
 import csv
 import json
 import argparse
@@ -39,6 +40,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+
+# Reuse the package-level pooling helpers when this script is run from a source checkout.
+_SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src'))
+if os.path.isdir(_SRC_DIR) and _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+try:
+    from palmsite._predict_impl import compute_pool_panels, pooled_file_meta
+except Exception as e:
+    raise RuntimeError(
+        "scripts/predict.py needs the package pooling helpers. Run from the repository root "
+        "or install the palmsite package first."
+    ) from e
 
 # AMP (deprecation-free API with fallback)
 try:
@@ -308,6 +321,10 @@ class RdRPModel(nn.Module):
             'mu': mu, 'sigma': sigma, 'alpha': alpha,
             'mu_attn': mu_attn, 'sigma_attn': sigma_attn,
             'w': w,
+            'H': H,
+            'w_anchor': w_anchor,
+            'c_anchor': c_anchor,
+            'c_gauss': c_gauss,
         }
 
 # ----------------------------
@@ -448,11 +465,37 @@ def main():
     ap.add_argument('--extract-h5', default=None, help='Path to HDF5 to write embedding vectors for catalytic spans')
     ap.add_argument('--min-p', type=float, default=0.90, help='Only export vectors for rows with P >= this threshold (default: 0.90)')
     ap.add_argument('--h5-coords', choices=['abs','chunk'], default='abs', help="Coordinate system for HDF5 pos: 'abs' (base_id, absolute 0-based AA) or 'chunk' (chunk_id, chunk-local index)")
-    # --- NEW: per-residue attention JSON output ---
+    # --- per-residue attention JSON output ---
     ap.add_argument(
         '--attn-json',
         default=None,
         help='Optional path to write residue-wise attention weights and mu/sigma per chunk as JSON.'
+    )
+    ap.add_argument(
+        '--pooled-json',
+        default=None,
+        help='Optional path to write compact pooled backbone vector panels for taxonomy/evolution analyses.'
+    )
+    ap.add_argument(
+        '--include-pools-in-attn-json',
+        action='store_true',
+        help='Also embed pooled vector panels inside each --attn-json entry.'
+    )
+    ap.add_argument(
+        '--pool-include-input',
+        action='store_true',
+        help='Also include original ESM-C input-embedding control panels in pooled JSON.'
+    )
+    ap.add_argument(
+        '--pool-top-k',
+        type=int,
+        default=32,
+        help='Number of highest-attention residues used for the top-k pooled panel.'
+    )
+    ap.add_argument(
+        '--pool-no-l2',
+        action='store_true',
+        help='Disable L2 normalization of pooled vectors.'
     )
 
     args = ap.parse_args()
@@ -619,8 +662,10 @@ def main():
         h5o.attrs['weight_type'] = 'final_attention'  # document what "w" is
         items_group = h5o.create_group('items')
 
-    # Optional JSON for residue-wise attention
+    # Optional JSON for residue-wise attention and compact pooled panels
     attn_json: Optional[Dict[str, Any]] = {} if args.attn_json else None
+    pooled_json: Optional[Dict[str, Any]] = {} if args.pooled_json else None
+    want_pools = (pooled_json is not None) or bool(args.include_pools_in_attn_json)
 
     # Write per-chunk CSV incrementally
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
@@ -662,49 +707,96 @@ def main():
 
                 # final attention over valid tokens
                 w_full = out['w'].detach().cpu().numpy()  # (B, T)
+                H_full = out['H'].detach().float().cpu().numpy() if want_pools else None
+                input_full = x[:, :, :-1].detach().float().cpu().numpy() if (want_pools and args.pool_include_input) else None
 
                 # indices under end-inclusive mapping (same as GFF)
                 S_idx = np.round(S * (Lcpu - 1)).astype(int)
                 E_idx = np.round(E * (Lcpu - 1)).astype(int)
                 mu_idx = np.round(mu * (Lcpu - 1)).astype(int)
 
-                # --- per-residue attention JSON storage ---
-                if attn_json is not None:
+                # --- per-residue attention JSON and compact pooled-panel JSON storage ---
+                if (attn_json is not None) or (pooled_json is not None) or bool(args.include_pools_in_attn_json):
                     for i, cid in enumerate(batch['chunk_ids']):
                         Li = int(Lcpu[i])
                         if Li <= 0:
                             continue
+                        bid = base_id_from_chunk(cid)
+                        s_local = max(0, min(int(S_idx[i]), Li - 1))
+                        e_local = max(0, min(int(E_idx[i]), Li - 1))
+                        if e_local < s_local:
+                            s_local, e_local = e_local, s_local
                         wi = w_full[i, :Li].astype(float, copy=False)
                         ostart = int(orig_start[i])
                         olen_i = int(orig_len[i])
                         abs_pos = (ostart + np.arange(Li, dtype=int)).tolist()
 
-                        attn_json[cid] = {
-                            "L": Li,
-                            "orig_start": ostart,
-                            "orig_len": olen_i,
+                        pools = None
+                        pool_meta = None
+                        if want_pools:
+                            inp_i = input_full[i, :Li] if input_full is not None else None
+                            pools, pool_meta = compute_pool_panels(
+                                H_full[i, :Li],
+                                wi,
+                                s_local,
+                                e_local,
+                                input_emb=inp_i,
+                                top_k=int(args.pool_top_k),
+                                l2_normalize=not bool(args.pool_no_l2),
+                            )
 
-                            # anchor-based parameters
-                            "mu": float(mu[i]),
-                            "sigma": float(sigma[i]),
+                        if pooled_json is not None:
+                            pooled_json[cid] = {
+                                "chunk_id": cid,
+                                "base_id": bid,
+                                "L": Li,
+                                "orig_start": ostart,
+                                "orig_len": olen_i,
+                                "P": float(P[i]),
+                                "S_norm": float(S[i]),
+                                "E_norm": float(E[i]),
+                                "S_idx": int(s_local),
+                                "E_idx": int(e_local),
+                                "mu": float(mu[i]),
+                                "sigma": float(sigma[i]),
+                                "mu_attn": float(mu_attn[i]),
+                                "sigma_attn": float(sigma_attn[i]),
+                                "pools": pools,
+                                "pool_meta": pool_meta,
+                            }
 
-                            # final-attention-based parameters
-                            "mu_attn": float(mu_attn[i]),
-                            "sigma_attn": float(sigma_attn[i]),
+                        if attn_json is not None:
+                            attn_entry = {
+                                "L": Li,
+                                "base_id": bid,
+                                "orig_start": ostart,
+                                "orig_len": olen_i,
 
-                            # canonical span (exactly what GFF uses)
-                            "S_norm": float(S[i]),
-                            "E_norm": float(E[i]),
-                            "S_idx": int(S_idx[i]),
-                            "E_idx": int(E_idx[i]),
+                                # anchor-based parameters
+                                "mu": float(mu[i]),
+                                "sigma": float(sigma[i]),
 
-                            # probability for convenience
-                            "P": float(P[i]),
+                                # final-attention-based parameters
+                                "mu_attn": float(mu_attn[i]),
+                                "sigma_attn": float(sigma_attn[i]),
 
-                            # per-residue final attention weights and positions
-                            "w": wi.tolist(),
-                            "abs_pos": abs_pos,
-                        }
+                                # canonical span (exactly what GFF uses)
+                                "S_norm": float(S[i]),
+                                "E_norm": float(E[i]),
+                                "S_idx": int(s_local),
+                                "E_idx": int(e_local),
+
+                                # probability for convenience
+                                "P": float(P[i]),
+
+                                # per-residue final attention weights and positions
+                                "w": wi.tolist(),
+                                "abs_pos": abs_pos,
+                            }
+                            if bool(args.include_pools_in_attn_json) and pools is not None:
+                                attn_entry["pools"] = pools
+                                attn_entry["pool_meta"] = pool_meta
+                            attn_json[cid] = attn_entry
 
                 # absolute mapping to original sequence
                 abs_S = orig_start + S_idx
@@ -875,12 +967,37 @@ def main():
     if h5o is not None:
         h5o.close()
 
+    # Mark which chunk should be used for one-vector-per-original-sequence analyses.
+    best_chunk_by_base = {bid: vals[1] for bid, vals in agg.items()}
+    for obj in (attn_json, pooled_json):
+        if obj is None:
+            continue
+        for cid, rec in obj.items():
+            if isinstance(rec, dict):
+                bid = rec.get("base_id", base_id_from_chunk(cid))
+                rec["is_best_base_chunk"] = bool(cid == best_chunk_by_base.get(bid))
+
     # Write attention JSON if requested
     if attn_json is not None:
         os.makedirs(os.path.dirname(args.attn_json) or '.', exist_ok=True)
         with open(args.attn_json, 'w', encoding='utf-8') as fjson:
             json.dump(attn_json, fjson, indent=2)
         print(f"Wrote residue-wise attention weights to: {args.attn_json}")
+
+    # Write compact pooled panels JSON if requested
+    if pooled_json is not None:
+        os.makedirs(os.path.dirname(args.pooled_json) or '.', exist_ok=True)
+        payload = {
+            "_meta": pooled_file_meta(
+                top_k=int(args.pool_top_k),
+                l2_normalize=not bool(args.pool_no_l2),
+                include_input=bool(args.pool_include_input),
+            )
+        }
+        payload.update(pooled_json)
+        with open(args.pooled_json, 'w', encoding='utf-8') as fjson:
+            json.dump(payload, fjson, indent=2)
+        print(f"Wrote pooled representation panels to: {args.pooled_json}")
 
     # Base-level CSV
     if args.base_out:
