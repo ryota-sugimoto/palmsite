@@ -46,7 +46,12 @@ _SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src'))
 if os.path.isdir(_SRC_DIR) and _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 try:
-    from palmsite._predict_impl import compute_pool_panels, pooled_file_meta
+    from palmsite._predict_impl import (
+        compute_pool_panels,
+        pooled_file_meta,
+        compute_backbone_vector_entry,
+        backbone_vectors_file_meta,
+    )
 except Exception as e:
     raise RuntimeError(
         "scripts/predict.py needs the package pooling helpers. Run from the repository root "
@@ -477,6 +482,28 @@ def main():
         help='Optional path to write compact pooled backbone vector panels for taxonomy/evolution analyses.'
     )
     ap.add_argument(
+        '--backbone-json',
+        default=None,
+        help='Optional path to write per-residue final PalmSite backbone H vectors as JSON for embedding alignment.'
+    )
+    ap.add_argument(
+        '--backbone-json-scope',
+        choices=['span', 'full'],
+        default='span',
+        help='Residues to export in --backbone-json: predicted catalytic span only or full valid chunk.'
+    )
+    ap.add_argument(
+        '--backbone-json-min-p',
+        type=float,
+        default=0.0,
+        help='Only include chunks with PalmSite probability >= this value in --backbone-json.'
+    )
+    ap.add_argument(
+        '--backbone-json-include-input',
+        action='store_true',
+        help='Also include matched raw ESM-C input token vectors in --backbone-json as controls.'
+    )
+    ap.add_argument(
         '--include-pools-in-attn-json',
         action='store_true',
         help='Also embed pooled vector panels inside each --attn-json entry.'
@@ -662,10 +689,13 @@ def main():
         h5o.attrs['weight_type'] = 'final_attention'  # document what "w" is
         items_group = h5o.create_group('items')
 
-    # Optional JSON for residue-wise attention and compact pooled panels
+    # Optional JSON for residue-wise attention, compact pooled panels, and
+    # per-residue PalmSite backbone vectors.
     attn_json: Optional[Dict[str, Any]] = {} if args.attn_json else None
     pooled_json: Optional[Dict[str, Any]] = {} if args.pooled_json else None
+    backbone_json: Optional[Dict[str, Any]] = {} if args.backbone_json else None
     want_pools = (pooled_json is not None) or bool(args.include_pools_in_attn_json)
+    want_backbone_vectors = backbone_json is not None
 
     # Write per-chunk CSV incrementally
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
@@ -707,8 +737,12 @@ def main():
 
                 # final attention over valid tokens
                 w_full = out['w'].detach().cpu().numpy()  # (B, T)
-                H_full = out['H'].detach().float().cpu().numpy() if want_pools else None
-                input_full = x[:, :, :-1].detach().float().cpu().numpy() if (want_pools and args.pool_include_input) else None
+                need_H = want_pools or want_backbone_vectors
+                need_input = (want_pools and args.pool_include_input) or (
+                    want_backbone_vectors and args.backbone_json_include_input
+                )
+                H_full = out['H'].detach().float().cpu().numpy() if need_H else None
+                input_full = x[:, :, :-1].detach().float().cpu().numpy() if need_input else None
 
                 # indices under end-inclusive mapping (same as GFF)
                 S_idx = np.round(S * (Lcpu - 1)).astype(int)
@@ -716,7 +750,12 @@ def main():
                 mu_idx = np.round(mu * (Lcpu - 1)).astype(int)
 
                 # --- per-residue attention JSON and compact pooled-panel JSON storage ---
-                if (attn_json is not None) or (pooled_json is not None) or bool(args.include_pools_in_attn_json):
+                if (
+                    (attn_json is not None)
+                    or (pooled_json is not None)
+                    or (backbone_json is not None)
+                    or bool(args.include_pools_in_attn_json)
+                ):
                     for i, cid in enumerate(batch['chunk_ids']):
                         Li = int(Lcpu[i])
                         if Li <= 0:
@@ -764,6 +803,31 @@ def main():
                                 "pools": pools,
                                 "pool_meta": pool_meta,
                             }
+
+                        if backbone_json is not None and float(P[i]) >= float(args.backbone_json_min_p):
+                            inp_i = input_full[i, :Li] if (
+                                input_full is not None and args.backbone_json_include_input
+                            ) else None
+                            backbone_json[cid] = compute_backbone_vector_entry(
+                                H_full[i, :Li],
+                                wi,
+                                s_local,
+                                e_local,
+                                chunk_id=cid,
+                                base_id=bid,
+                                L=Li,
+                                orig_start=ostart,
+                                orig_len=olen_i,
+                                P=float(P[i]),
+                                S_norm=float(S[i]),
+                                E_norm=float(E[i]),
+                                mu=float(mu[i]),
+                                sigma=float(sigma[i]),
+                                mu_attn=float(mu_attn[i]),
+                                sigma_attn=float(sigma_attn[i]),
+                                input_emb=inp_i,
+                                scope=str(args.backbone_json_scope),
+                            )
 
                         if attn_json is not None:
                             attn_entry = {
@@ -969,7 +1033,7 @@ def main():
 
     # Mark which chunk should be used for one-vector-per-original-sequence analyses.
     best_chunk_by_base = {bid: vals[1] for bid, vals in agg.items()}
-    for obj in (attn_json, pooled_json):
+    for obj in (attn_json, pooled_json, backbone_json):
         if obj is None:
             continue
         for cid, rec in obj.items():
@@ -998,6 +1062,21 @@ def main():
         with open(args.pooled_json, 'w', encoding='utf-8') as fjson:
             json.dump(payload, fjson, indent=2)
         print(f"Wrote pooled representation panels to: {args.pooled_json}")
+
+    # Write per-residue PalmSite backbone vectors JSON if requested
+    if backbone_json is not None:
+        os.makedirs(os.path.dirname(args.backbone_json) or '.', exist_ok=True)
+        payload = {
+            "_meta": backbone_vectors_file_meta(
+                scope=str(args.backbone_json_scope),
+                min_p=float(args.backbone_json_min_p),
+                include_input=bool(args.backbone_json_include_input),
+            )
+        }
+        payload.update(backbone_json)
+        with open(args.backbone_json, 'w', encoding='utf-8') as fjson:
+            json.dump(payload, fjson, indent=2)
+        print(f"Wrote per-residue PalmSite backbone vectors to: {args.backbone_json}")
 
     # Base-level CSV
     if args.base_out:

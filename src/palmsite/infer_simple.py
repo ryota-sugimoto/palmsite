@@ -107,6 +107,12 @@ def predict_to_gff(
     pool_top_k: int = 32,
     pool_l2_normalize: bool = True,
     return_artifacts: bool = False,
+    return_pooled: Optional[bool] = None,
+    backbone_json: str | None = None,
+    backbone_json_scope: str = "span",
+    backbone_json_min_p: float = 0.0,
+    backbone_json_include_input: bool = False,
+    return_backbone_vectors: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Run PalmSite on an embeddings.h5 file and write GFF3 to out_stream.
@@ -114,16 +120,22 @@ def predict_to_gff(
     If attn_json is not None, also write a JSON file with per-chunk
     residue-wise attention details. If pooled_json is provided, write compact
     pooled vectors for zero-shot taxonomy/evolution analyses. The recommended
-    panel is pools.backbone.span_attn_norm.
+    panel is pools.backbone.span_attn_norm. If backbone_json is provided, write
+    per-residue PalmSite backbone H vectors for embedding-alignment analyses.
 
-    If return_artifacts is True, return {"attn": ..., "pooled": ...}; this is
+    If return_artifacts is True, return available artifact dictionaries; this is
     used by the streaming CLI to write JSON incrementally.
     """
     try:
         import torch
         from torch.utils.data import DataLoader
         from ._predict_impl import (
-            EmbOnlyDataset, collate, compute_pool_panels, pooled_file_meta
+            EmbOnlyDataset,
+            collate,
+            compute_pool_panels,
+            pooled_file_meta,
+            compute_backbone_vector_entry,
+            backbone_vectors_file_meta,
         )
     except ImportError as e:
         raise RuntimeError(
@@ -142,10 +154,13 @@ def predict_to_gff(
 
     best: Dict[str, Tuple[float, str, int, int, int, float, int]] = {}
 
-    want_pools = (pooled_json is not None) or bool(return_artifacts) or bool(include_pools_in_attn_json)
+    want_pooled_return = bool(return_artifacts) if return_pooled is None else bool(return_pooled)
+    want_pools = (pooled_json is not None) or want_pooled_return or bool(include_pools_in_attn_json)
+    want_backbone_vectors = (backbone_json is not None) or bool(return_backbone_vectors)
     want_attn = (attn_json is not None) or bool(return_attn) or (bool(include_pools_in_attn_json) and want_pools)
     attn_obj: Optional[Dict[str, Any]] = {} if want_attn else None
     pool_obj: Optional[Dict[str, Any]] = {} if want_pools else None
+    backbone_obj: Optional[Dict[str, Any]] = {} if want_backbone_vectors else None
 
     if write_header:
         out_stream.write("##gff-version 3\n")
@@ -165,8 +180,10 @@ def predict_to_gff(
             mu_attn = o["mu_attn"].cpu().numpy()
             sigma_attn = o["sigma_attn"].cpu().numpy()
             w_full = o["w"].cpu().numpy()
-            H_full = o["H"].detach().float().cpu().numpy() if want_pools else None
-            input_full = x[:, :, :-1].detach().float().cpu().numpy() if (want_pools and pool_include_input) else None
+            need_H = want_pools or want_backbone_vectors
+            need_input = (want_pools and pool_include_input) or (want_backbone_vectors and backbone_json_include_input)
+            H_full = o["H"].detach().float().cpu().numpy() if need_H else None
+            input_full = x[:, :, :-1].detach().float().cpu().numpy() if need_input else None
 
             Lnp = b["L"].cpu().numpy().astype(int)
             S_idx = np.round(S * (Lnp - 1)).astype(int)
@@ -241,6 +258,29 @@ def predict_to_gff(
                         "pool_meta": pool_meta,
                     }
 
+                if backbone_obj is not None and pi >= float(backbone_json_min_p):
+                    inp_i = input_full[i, :Li] if (input_full is not None and backbone_json_include_input) else None
+                    backbone_obj[cid] = compute_backbone_vector_entry(
+                        H_full[i, :Li],
+                        wi,
+                        s_local,
+                        e_local,
+                        chunk_id=cid,
+                        base_id=bid,
+                        L=Li,
+                        orig_start=ostart,
+                        orig_len=olen_i,
+                        P=pi,
+                        S_norm=float(S[i]),
+                        E_norm=float(E[i]),
+                        mu=float(mu[i]),
+                        sigma=float(sigma[i]),
+                        mu_attn=float(mu_attn[i]),
+                        sigma_attn=float(sigma_attn[i]),
+                        input_emb=inp_i,
+                        scope=str(backbone_json_scope),
+                    )
+
                 if attn_obj is not None:
                     attn_entry = {
                         "L": Li,
@@ -265,7 +305,7 @@ def predict_to_gff(
                     attn_obj[cid] = attn_entry
 
     best_chunk_by_base = {bid: vals[1] for bid, vals in best.items()}
-    for obj in (attn_obj, pool_obj):
+    for obj in (attn_obj, pool_obj, backbone_obj):
         if obj is None:
             continue
         for cid, rec in obj.items():
@@ -311,8 +351,21 @@ def predict_to_gff(
         with open(pooled_json, "w", encoding="utf-8") as fjson:
             json.dump(payload, fjson, indent=2)
 
+    if backbone_obj is not None and backbone_json is not None:
+        os.makedirs(os.path.dirname(backbone_json) or ".", exist_ok=True)
+        payload = {
+            "_meta": backbone_vectors_file_meta(
+                scope=str(backbone_json_scope),
+                min_p=float(backbone_json_min_p),
+                include_input=bool(backbone_json_include_input),
+            )
+        }
+        payload.update(backbone_obj)
+        with open(backbone_json, "w", encoding="utf-8") as fjson:
+            json.dump(payload, fjson, indent=2)
+
     if return_artifacts:
-        return {"attn": attn_obj or {}, "pooled": pool_obj or {}}
+        return {"attn": attn_obj or {}, "pooled": pool_obj or {}, "backbone_vectors": backbone_obj or {}}
 
     if return_attn:
         return attn_obj or {}

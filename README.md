@@ -23,6 +23,12 @@ As of **v0.2.0**, PalmSite can also optionally output **per-residue attention we
   ```bash
   palmsite --pooled-json pooled_panels.json <fasta>
   ```
+
+* **New:** per-residue final PalmSite backbone vectors for embedding-based residue alignment:
+
+  ```bash
+  palmsite --backbone-json backbone_vectors.json <fasta>
+  ```
 * **High precision and recall AUC** (internal benchmarks):
 
 | Backbone (ESM-C) | Positives vs. Negatives | Positives vs. Rest |
@@ -178,6 +184,55 @@ is_best_base_chunk == true
 
 ---
 
+## **NEW: Per-residue PalmSite backbone vectors for embedding alignment**
+
+For residue-residue embedding alignment, PalmSite can export the full token-level internal representation:
+
+```bash
+palmsite \
+  -o result.gff \
+  --backbone-json backbone_vectors.json \
+  examples/myproteins.fasta
+```
+
+By default, this writes vectors only for the predicted catalytic span to keep the JSON smaller. Use `--backbone-json-scope full` to export all valid residues in each embedded chunk.
+
+Each entry in `backbone_vectors.json` contains:
+
+```json
+{
+  "chunk_id": {
+    "base_id": "original_sequence_id",
+    "is_best_base_chunk": true,
+    "P": 0.99,
+    "S_idx": 100,
+    "E_idx": 180,
+    "scope": "span",
+    "local_pos": [100, 101, 102],
+    "abs_pos": [500, 501, 502],
+    "w": [... final PalmSite attention weights for exported residues ...],
+    "vectors": [[... 256-dim PalmSite backbone H vector ...]]
+  }
+}
+```
+
+Useful options:
+
+```bash
+# Export all valid residues instead of only the predicted catalytic span
+palmsite --backbone-json backbone_vectors.json --backbone-json-scope full <fasta>
+
+# Export only chunks above a PalmSite probability threshold
+palmsite --backbone-json backbone_vectors.json --backbone-json-min-p 0.5 <fasta>
+
+# Also include raw ESM-C token vectors as a control representation
+palmsite --backbone-json backbone_vectors.json --backbone-json-include-input <fasta>
+```
+
+This JSON can become very large because each exported residue stores a 256-dimensional vector. For embedding alignment focused on the catalytic core, the default `span` scope is usually the practical choice.
+
+---
+
 ## **Command-line usage**
 
 ```
@@ -204,6 +259,11 @@ Usage: palmsite -p 0.5 [-o result.gff] [--attn-json details.json] <fasta ...>
   --keep-tmp                      Keep temp files (sanitized FASTA + per-batch embeddings)
   --attn-json PATH                Write per-residue attention JSON (can be large)
   --pooled-json PATH              Write compact pooled backbone vector panels
+  --backbone-json PATH            Write per-residue PalmSite backbone H vectors
+  --backbone-json-scope [span|full]
+                                  Export predicted span only or full valid chunk [default: span]
+  --backbone-json-min-p FLOAT     Minimum P for backbone-vector JSON entries [default: 0.0]
+  --backbone-json-include-input   Also include raw ESM-C token vectors as controls
   --include-pools-in-attn-json    Embed pooled panels inside each attention JSON entry
   --pool-include-input            Also include raw ESM-C input-embedding control panels
   --pool-top-k INTEGER            Number of residues for top-k attention panel [default: 32]

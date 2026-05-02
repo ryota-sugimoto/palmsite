@@ -509,6 +509,142 @@ def pooled_file_meta(*, top_k: int = 32, l2_normalize: bool = True, include_inpu
     }
 
 
+
+def backbone_vectors_file_meta(
+    *,
+    scope: str = "span",
+    min_p: float = 0.0,
+    include_input: bool = False,
+) -> Dict[str, Any]:
+    """Metadata block for per-residue PalmSite backbone-vector JSON files."""
+    return {
+        "schema": "palmsite_backbone_vectors.v1",
+        "description": (
+            "Per-residue final PalmSite token-backbone vectors for embedding-based "
+            "residue alignment and model-dissection analyses."
+        ),
+        "primary_vector_key": "vectors",
+        "vector_source": "final PalmSite backbone H = model.forward(...)[\"H\"] after TokenBackbone.",
+        "vector_dim": 256,
+        "scope": str(scope),
+        "min_p": float(min_p),
+        "include_input_controls": bool(include_input),
+        "weight_type": "final_attention_w",
+        "coordinates": (
+            "local_pos are chunk-local 0-based residue indices; abs_pos are 0-based "
+            "coordinates in the original unchunked sequence; S_idx/E_idx are chunk-local "
+            "0-based inclusive span coordinates."
+        ),
+        "filtering_note": "For one vector set per original sequence, keep entries where is_best_base_chunk is true.",
+        "json_size_note": "This file can become very large because it stores one 256-dimensional vector per exported residue.",
+    }
+
+
+def compute_backbone_vector_entry(
+    H: np.ndarray,
+    w: np.ndarray,
+    s_idx: int,
+    e_idx: int,
+    *,
+    chunk_id: str,
+    base_id: str,
+    L: int,
+    orig_start: int,
+    orig_len: int,
+    P: float,
+    S_norm: float,
+    E_norm: float,
+    mu: float,
+    sigma: float,
+    mu_attn: float,
+    sigma_attn: float,
+    input_emb: Optional[np.ndarray] = None,
+    scope: str = "span",
+) -> Dict[str, Any]:
+    """
+    Build one JSON-serializable record containing per-residue PalmSite backbone vectors.
+
+    Parameters
+    ----------
+    H
+        Final PalmSite backbone representation for one chunk, shape (L, 256).
+    w
+        Final PalmSite attention weights for the same chunk, shape (L,).
+    s_idx, e_idx
+        Chunk-local inclusive predicted catalytic span coordinates.
+    scope
+        "span" exports only S_idx..E_idx; "full" exports all valid residues in the chunk.
+    """
+    H = np.asarray(H, dtype=np.float32)
+    w = np.asarray(w, dtype=np.float32).reshape(-1)
+    L = int(L)
+    if H.ndim != 2:
+        raise ValueError(f"H must be 2-dimensional, got shape {H.shape}")
+    if L < 0:
+        raise ValueError(f"L must be non-negative, got {L}")
+    if H.shape[0] < L:
+        raise ValueError(f"H length {H.shape[0]} is shorter than L={L}")
+    if w.shape[0] < L:
+        raise ValueError(f"attention length {w.shape[0]} is shorter than L={L}")
+
+    H = H[:L]
+    w = w[:L]
+    if L == 0:
+        local_idx = np.zeros((0,), dtype=np.int32)
+        s = e = 0
+    else:
+        s = max(0, min(int(s_idx), L - 1))
+        e = max(0, min(int(e_idx), L - 1))
+        if e < s:
+            s, e = e, s
+        if scope == "span":
+            local_idx = np.arange(s, e + 1, dtype=np.int32)
+        elif scope == "full":
+            local_idx = np.arange(L, dtype=np.int32)
+        else:
+            raise ValueError(f"Unsupported backbone vector scope {scope!r}; use 'span' or 'full'")
+
+    abs_pos = (int(orig_start) + local_idx.astype(np.int64)).astype(np.int64)
+    vecs = H[local_idx] if local_idx.size else H[:0]
+
+    entry: Dict[str, Any] = {
+        "chunk_id": chunk_id,
+        "base_id": base_id,
+        "L": int(L),
+        "orig_start": int(orig_start),
+        "orig_len": int(orig_len),
+        "P": float(P),
+        "S_norm": float(S_norm),
+        "E_norm": float(E_norm),
+        "S_idx": int(s),
+        "E_idx": int(e),
+        "mu": float(mu),
+        "sigma": float(sigma),
+        "mu_attn": float(mu_attn),
+        "sigma_attn": float(sigma_attn),
+        "scope": str(scope),
+        "vector_source": "final_palmSite_backbone_H",
+        "vector_dim": int(H.shape[1]),
+        "local_pos": [int(x) for x in local_idx.tolist()],
+        "abs_pos": [int(x) for x in abs_pos.tolist()],
+        "w": w[local_idx].astype(np.float32, copy=False).tolist(),
+        "vectors": vecs.astype(np.float32, copy=False).tolist(),
+    }
+
+    if input_emb is not None:
+        inp = np.asarray(input_emb, dtype=np.float32)
+        if inp.ndim != 2:
+            raise ValueError(f"input_emb must be 2-dimensional, got shape {inp.shape}")
+        if inp.shape[0] < L:
+            raise ValueError(f"input_emb length {inp.shape[0]} is shorter than L={L}")
+        inp = inp[:L]
+        entry["input_vector_source"] = "raw_ESM-C_token_embedding_before_PalmSite_pos_channel"
+        entry["input_vector_dim"] = int(inp.shape[1])
+        entry["input_vectors"] = inp[local_idx].astype(np.float32, copy=False).tolist()
+
+    return entry
+
+
 # ----------------------------
 # HPD helper
 # ----------------------------
@@ -635,10 +771,13 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
     # Aggregate best per base_id
     agg: Dict[str, Tuple[float, str, int, int, int, float, int, float, float, float]] = {}
 
-    # Optional per-residue attention JSON output and compact pooled-vector JSON output
+    # Optional per-residue attention JSON output, compact pooled-vector JSON output,
+    # and full per-residue PalmSite-backbone-vector JSON output.
     attn_json: Optional[Dict[str, Any]] = {} if getattr(args, "attn_json", None) else None
     pooled_json: Optional[Dict[str, Any]] = {} if getattr(args, "pooled_json", None) else None
+    backbone_json: Optional[Dict[str, Any]] = {} if getattr(args, "backbone_json", None) else None
     want_pools = (pooled_json is not None) or bool(getattr(args, "include_pools_in_attn_json", False))
+    want_backbone_vectors = backbone_json is not None
 
     with torch.no_grad():
         for b in dl:
@@ -662,8 +801,12 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
             mu_attn = out["mu_attn"].detach().cpu().numpy()
             sigma_attn = out["sigma_attn"].detach().cpu().numpy()
             w_full = out["w"].detach().cpu().numpy()  # (B, T)
-            H_full = out["H"].detach().float().cpu().numpy() if want_pools else None
-            input_full = x[:, :, :-1].detach().float().cpu().numpy() if (want_pools and getattr(args, "pool_include_input", False)) else None
+            need_H = want_pools or want_backbone_vectors
+            need_input = (want_pools and getattr(args, "pool_include_input", False)) or (
+                want_backbone_vectors and getattr(args, "backbone_json_include_input", False)
+            )
+            H_full = out["H"].detach().float().cpu().numpy() if need_H else None
+            input_full = x[:, :, :-1].detach().float().cpu().numpy() if need_input else None
 
             Lnp   = b["L"].detach().cpu().numpy().astype(int)
             S_idx = np.round(S * (Lnp - 1)).astype(int)
@@ -673,7 +816,12 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
             orig_len   = b["orig_len"].detach().cpu().numpy().astype(int)
 
             # Optional per-residue attention JSON and compact pooled panels
-            if (attn_json is not None) or (pooled_json is not None) or bool(getattr(args, "include_pools_in_attn_json", False)):
+            if (
+                (attn_json is not None)
+                or (pooled_json is not None)
+                or (backbone_json is not None)
+                or bool(getattr(args, "include_pools_in_attn_json", False))
+            ):
                 for i, cid in enumerate(b["chunk_ids"]):
                     Li = int(Lnp[i])
                     if Li <= 0:
@@ -721,6 +869,31 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
                             "pools": pools,
                             "pool_meta": pool_meta,
                         }
+
+                    if backbone_json is not None and float(P[i]) >= float(getattr(args, "backbone_json_min_p", 0.0)):
+                        inp_i = input_full[i, :Li] if (
+                            input_full is not None and getattr(args, "backbone_json_include_input", False)
+                        ) else None
+                        backbone_json[cid] = compute_backbone_vector_entry(
+                            H_full[i, :Li],
+                            wi,
+                            s_local,
+                            e_local,
+                            chunk_id=cid,
+                            base_id=bid,
+                            L=Li,
+                            orig_start=ostart,
+                            orig_len=olen_i,
+                            P=float(P[i]),
+                            S_norm=float(S[i]),
+                            E_norm=float(E[i]),
+                            mu=float(mu[i]),
+                            sigma=float(sigma[i]),
+                            mu_attn=float(mu_attn[i]),
+                            sigma_attn=float(sigma_attn[i]),
+                            input_emb=inp_i,
+                            scope=str(getattr(args, "backbone_json_scope", "span")),
+                        )
 
                     if attn_json is not None:
                         attn_entry = {
@@ -777,7 +950,7 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
 
     # Mark which chunk should be used for one-vector-per-original-sequence analyses.
     best_chunk_by_base = {bid: vals[1] for bid, vals in agg.items()}
-    for obj in (attn_json, pooled_json):
+    for obj in (attn_json, pooled_json, backbone_json):
         if obj is None:
             continue
         for cid, rec in obj.items():
@@ -806,6 +979,21 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
         with open(args.pooled_json, "w", encoding="utf-8") as fjson:
             json.dump(payload, fjson, indent=2)
         print(f"Wrote pooled representation panels to: {args.pooled_json}")
+
+    # Write per-residue PalmSite backbone vectors JSON to disk if requested
+    if backbone_json is not None and getattr(args, "backbone_json", None):
+        os.makedirs(os.path.dirname(args.backbone_json) or ".", exist_ok=True)
+        payload = {
+            "_meta": backbone_vectors_file_meta(
+                scope=str(getattr(args, "backbone_json_scope", "span")),
+                min_p=float(getattr(args, "backbone_json_min_p", 0.0)),
+                include_input=bool(getattr(args, "backbone_json_include_input", False)),
+            )
+        }
+        payload.update(backbone_json)
+        with open(args.backbone_json, "w", encoding="utf-8") as fjson:
+            json.dump(payload, fjson, indent=2)
+        print(f"Wrote per-residue PalmSite backbone vectors to: {args.backbone_json}")
 
     # Base-level TSV
     if args.base_out:
@@ -895,6 +1083,28 @@ def main():
         help="Optional path to write compact pooled backbone vector panels for taxonomy/evolution analyses.",
     )
     ap.add_argument(
+        "--backbone-json",
+        default=None,
+        help="Optional path to write per-residue final PalmSite backbone H vectors as JSON for embedding alignment.",
+    )
+    ap.add_argument(
+        "--backbone-json-scope",
+        choices=["span", "full"],
+        default="span",
+        help="Residues to export in --backbone-json: predicted catalytic span only or full valid chunk.",
+    )
+    ap.add_argument(
+        "--backbone-json-min-p",
+        type=float,
+        default=0.0,
+        help="Only include chunks with PalmSite probability >= this value in --backbone-json.",
+    )
+    ap.add_argument(
+        "--backbone-json-include-input",
+        action="store_true",
+        help="Also include matched raw ESM-C input token vectors in --backbone-json as controls.",
+    )
+    ap.add_argument(
         "--include-pools-in-attn-json",
         action="store_true",
         help="Also embed pooled vector panels inside each --attn-json entry.",
@@ -935,7 +1145,8 @@ def main():
 def predict_from_h5(embeddings: str, checkpoint: str, out_csv: str,
                     gff_out: str | None = None, gff_min_p: float = 0.0,
                     ids_file: str | None = None,
-                    attn_json: str | None = None) -> None:
+                    attn_json: str | None = None,
+                    backbone_json: str | None = None) -> None:
     """Library-friendly wrapper that calls this module as a CLI in-process."""
     import subprocess
     cmd = [sys.executable, '-m', 'palmsite._predict_impl',
@@ -949,6 +1160,8 @@ def predict_from_h5(embeddings: str, checkpoint: str, out_csv: str,
         cmd += ['--ids-file', ids_file]
     if attn_json is not None:
         cmd += ['--attn-json', attn_json]
+    if backbone_json is not None:
+        cmd += ['--backbone-json', backbone_json]
     proc = subprocess.run(cmd, text=True, capture_output=True)
     if proc.returncode != 0:
         raise RuntimeError(f"predict_from_h5 failed: {proc.stderr.strip()}")

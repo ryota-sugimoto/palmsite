@@ -153,6 +153,31 @@ def _pooled_file_meta_cli(*, top_k: int = 32, l2_normalize: bool = True, include
     }
 
 
+
+def _backbone_vectors_file_meta_cli(*, scope: str = "span", min_p: float = 0.0, include_input: bool = False) -> Dict[str, Any]:
+    return {
+        "schema": "palmsite_backbone_vectors.v1",
+        "description": (
+            "Per-residue final PalmSite token-backbone vectors for embedding-based "
+            "residue alignment and model-dissection analyses."
+        ),
+        "primary_vector_key": "vectors",
+        "vector_source": "final PalmSite backbone H = model.forward(...)[\"H\"] after TokenBackbone.",
+        "vector_dim": 256,
+        "scope": str(scope),
+        "min_p": float(min_p),
+        "include_input_controls": bool(include_input),
+        "weight_type": "final_attention_w",
+        "coordinates": (
+            "local_pos are chunk-local 0-based residue indices; abs_pos are 0-based "
+            "coordinates in the original unchunked sequence; S_idx/E_idx are chunk-local "
+            "0-based inclusive span coordinates."
+        ),
+        "filtering_note": "For one vector set per original sequence, keep entries where is_best_base_chunk is true.",
+        "json_size_note": "This file can become very large because it stores one 256-dimensional vector per exported residue.",
+    }
+
+
 @click.command(context_settings=dict(help_option_names=["-h", "--help"]))
 @click.version_option(__version__, prog_name="palmsite")
 @click.option(
@@ -214,6 +239,30 @@ def _pooled_file_meta_cli(*, top_k: int = 32, l2_normalize: bool = True, include
     help="Write compact pooled backbone vector panels as JSON for taxonomy/evolution comparisons",
 )
 @click.option(
+    "--backbone-json",
+    default=None,
+    help="Write per-residue final PalmSite backbone H vectors as JSON for embedding alignment",
+)
+@click.option(
+    "--backbone-json-scope",
+    default="span",
+    show_default=True,
+    type=click.Choice(["span", "full"], case_sensitive=False),
+    help="Residues to export in --backbone-json: predicted catalytic span only or full valid chunk",
+)
+@click.option(
+    "--backbone-json-min-p",
+    default=0.0,
+    show_default=True,
+    type=float,
+    help="Only include chunks with PalmSite probability >= this value in --backbone-json",
+)
+@click.option(
+    "--backbone-json-include-input",
+    is_flag=True,
+    help="Also include matched raw ESM-C input token vectors in --backbone-json as controls",
+)
+@click.option(
     "--include-pools-in-attn-json", is_flag=True,
     help="Also embed pooled vector panels inside each --attn-json entry",
 )
@@ -253,6 +302,10 @@ def main(
     keep_tmp,
     attn_json,
     pooled_json,
+    backbone_json,
+    backbone_json_scope,
+    backbone_json_min_p,
+    backbone_json_include_input,
     include_pools_in_attn_json,
     pool_include_input,
     pool_top_k,
@@ -334,6 +387,7 @@ def main(
     out_fp = None
     attn_writer: Optional[_AttnJSONWriter] = None
     pool_writer: Optional[_AttnJSONWriter] = None
+    backbone_writer: Optional[_AttnJSONWriter] = None
     try:
         # Prepare output stream
         if gff_out:
@@ -354,6 +408,17 @@ def main(
                     top_k=int(pool_top_k),
                     l2_normalize=not bool(pool_no_l2),
                     include_input=bool(pool_include_input),
+                )
+            })
+
+        # Prepare per-residue PalmSite-backbone-vector writer (incremental).
+        if backbone_json:
+            backbone_writer = _AttnJSONWriter(backbone_json)
+            backbone_writer.write_dict({
+                "_meta": _backbone_vectors_file_meta_cli(
+                    scope=str(backbone_json_scope),
+                    min_p=float(backbone_json_min_p),
+                    include_input=bool(backbone_json_include_input),
                 )
             })
 
@@ -394,7 +459,7 @@ def main(
 
             # Predict and stream GFF
             try:
-                want_artifacts = bool(pool_writer)
+                want_artifacts = bool(pool_writer or backbone_writer)
                 result = predict_to_gff(
                     embeddings_h5=str(batch_h5),
                     backbone=backbone,
@@ -412,6 +477,11 @@ def main(
                     pool_top_k=int(pool_top_k),
                     pool_l2_normalize=not bool(pool_no_l2),
                     return_artifacts=want_artifacts,
+                    return_pooled=bool(pool_writer),
+                    return_backbone_vectors=bool(backbone_writer),
+                    backbone_json_scope=str(backbone_json_scope),
+                    backbone_json_min_p=float(backbone_json_min_p),
+                    backbone_json_include_input=bool(backbone_json_include_input),
                 )
                 header_written = True
 
@@ -419,14 +489,18 @@ def main(
                     artifacts = result or {}
                     attn_obj = artifacts.get("attn", {}) if isinstance(artifacts, dict) else {}
                     pooled_obj = artifacts.get("pooled", {}) if isinstance(artifacts, dict) else {}
+                    backbone_obj = artifacts.get("backbone_vectors", {}) if isinstance(artifacts, dict) else {}
                 else:
                     attn_obj = result or {}
                     pooled_obj = {}
+                    backbone_obj = {}
 
                 if attn_writer and attn_obj:
                     attn_writer.write_dict(attn_obj)
                 if pool_writer and pooled_obj:
                     pool_writer.write_dict(pooled_obj)
+                if backbone_writer and backbone_obj:
+                    backbone_writer.write_dict(backbone_obj)
             except Exception as e:
                 click.echo(f"Inference failed (batch {n_batches}): {e}", err=True)
                 sys.exit(2)
@@ -449,6 +523,8 @@ def main(
             attn_writer.close()
         if pool_writer:
             pool_writer.close()
+        if backbone_writer:
+            backbone_writer.close()
         if out_fp:
             out_fp.close()
         if (not tmp_dir) and (not keep_tmp):
