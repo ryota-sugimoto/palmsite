@@ -285,3 +285,57 @@ def test_backbone_json_is_streamed_from_predictor(tmp_path, dummy_embed, monkeyp
     assert payload["_meta"]["scope"] == "full"
     entry = payload["toy|chunk_0001_of_0001|aa_000000_000012"]
     assert entry["vectors"] == [[1.0, 0.0], [0.0, 1.0]]
+
+
+def test_logits_json_is_streamed_from_predictor(tmp_path, dummy_embed, monkeypatch):
+    fa = tmp_path / "logits_json.faa"
+    _write_fasta(fa, [("lg", "M" * 18)])
+    out_json = tmp_path / "logits.json"
+
+    seen: dict[str, object] = {}
+
+    def _fake_predict(
+        embeddings_h5: str,
+        backbone: str,
+        model_id,
+        revision,
+        min_p: float,
+        out_stream,
+        **kwargs,
+    ):
+        seen["return_logits"] = kwargs.get("return_logits")
+        seen["return_artifacts"] = kwargs.get("return_artifacts")
+        if kwargs.get("write_header", True):
+            out_stream.write("##gff-version 3\n")
+        out_stream.write("toy\tPalmSite\tRdRP_domain\t3\t9\t0.900000\t.\t.\tID=toy;P=0.900000\n")
+        return {
+            "attn": {},
+            "pooled": {},
+            "backbone_vectors": {},
+            "logits": {
+                "toy|chunk_0001_of_0001|aa_000000_000012": {
+                    "chunk_id": "toy|chunk_0001_of_0001|aa_000000_000012",
+                    "base_id": "toy",
+                    "P": 0.9,
+                    "logit": 4.2,
+                    "calibrated_logit": 3.7,
+                    "temperature": 1.135,
+                    "is_best_base_chunk": True,
+                }
+            },
+        }
+
+    monkeypatch.setattr("palmsite.cli.predict_to_gff", _fake_predict)
+
+    runner = CliRunner()
+    result = runner.invoke(palmsite_cli, ["--logits-json", str(out_json), str(fa)])
+
+    assert result.exit_code == 0, result.output
+    assert seen["return_logits"] is True
+    assert seen["return_artifacts"] is True
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    assert payload["_meta"]["schema"] == "palmsite_logits.v1"
+    entry = payload["toy|chunk_0001_of_0001|aa_000000_000012"]
+    assert entry["logit"] == 4.2
+    assert entry["calibrated_logit"] == 3.7
+    assert entry["temperature"] == 1.135

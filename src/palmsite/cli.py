@@ -154,6 +154,19 @@ def _pooled_file_meta_cli(*, top_k: int = 32, l2_normalize: bool = True, include
 
 
 
+
+
+def _logits_file_meta_cli(temperature: float | None = None) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "schema": "palmsite_logits.v1",
+        "description": "Per-chunk PalmSite raw logits and temperature-calibrated logits.",
+        "logit": "Raw model sequence logit before temperature scaling.",
+        "calibrated_logit": "logit / temperature; sigmoid(calibrated_logit) equals P.",
+    }
+    if temperature is not None:
+        meta["temperature"] = float(temperature)
+    return meta
+
 def _backbone_vectors_file_meta_cli(*, scope: str = "span", min_p: float = 0.0, include_input: bool = False) -> Dict[str, Any]:
     return {
         "schema": "palmsite_backbone_vectors.v1",
@@ -168,6 +181,11 @@ def _backbone_vectors_file_meta_cli(*, scope: str = "span", min_p: float = 0.0, 
         "min_p": float(min_p),
         "include_input_controls": bool(include_input),
         "weight_type": "final_attention_w",
+        "logit_fields": {
+            "logit": "Raw model sequence logit before temperature scaling.",
+            "calibrated_logit": "logit / temperature; sigmoid(calibrated_logit) equals P.",
+            "temperature": "Temperature used for probability calibration.",
+        },
         "coordinates": (
             "local_pos are chunk-local 0-based residue indices; abs_pos are 0-based "
             "coordinates in the original unchunked sequence; S_idx/E_idx are chunk-local "
@@ -233,6 +251,10 @@ def _backbone_vectors_file_meta_cli(*, scope: str = "span", min_p: float = 0.0, 
 @click.option(
     "--attn-json", default=None,
     help="Write per-residue attention + span details as JSON (can be large)",
+)
+@click.option(
+    "--logits-json", default=None,
+    help="Write compact per-chunk raw and temperature-calibrated logits as JSON",
 )
 @click.option(
     "--pooled-json", default=None,
@@ -301,6 +323,7 @@ def main(
     verbose,
     keep_tmp,
     attn_json,
+    logits_json,
     pooled_json,
     backbone_json,
     backbone_json_scope,
@@ -386,6 +409,7 @@ def main(
 
     out_fp = None
     attn_writer: Optional[_AttnJSONWriter] = None
+    logits_writer: Optional[_AttnJSONWriter] = None
     pool_writer: Optional[_AttnJSONWriter] = None
     backbone_writer: Optional[_AttnJSONWriter] = None
     try:
@@ -399,6 +423,11 @@ def main(
         # Prepare attention writer (incremental)
         if attn_json:
             attn_writer = _AttnJSONWriter(attn_json)
+
+        # Prepare compact logits writer (incremental).
+        if logits_json:
+            logits_writer = _AttnJSONWriter(logits_json)
+            logits_writer.write_dict({"_meta": _logits_file_meta_cli()})
 
         # Prepare compact pooled-vector writer (incremental).
         if pooled_json:
@@ -459,7 +488,7 @@ def main(
 
             # Predict and stream GFF
             try:
-                want_artifacts = bool(pool_writer or backbone_writer)
+                want_artifacts = bool(pool_writer or backbone_writer or logits_writer)
                 result = predict_to_gff(
                     embeddings_h5=str(batch_h5),
                     backbone=backbone,
@@ -471,6 +500,8 @@ def main(
                     attn_json=None,  # handled incrementally here
                     write_header=(not header_written),
                     return_attn=bool(attn_writer),
+                    logits_json=None,  # handled incrementally here
+                    return_logits=bool(logits_writer),
                     pooled_json=None,  # handled incrementally here
                     include_pools_in_attn_json=bool(include_pools_in_attn_json),
                     pool_include_input=bool(pool_include_input),
@@ -490,13 +521,17 @@ def main(
                     attn_obj = artifacts.get("attn", {}) if isinstance(artifacts, dict) else {}
                     pooled_obj = artifacts.get("pooled", {}) if isinstance(artifacts, dict) else {}
                     backbone_obj = artifacts.get("backbone_vectors", {}) if isinstance(artifacts, dict) else {}
+                    logits_obj = artifacts.get("logits", {}) if isinstance(artifacts, dict) else {}
                 else:
                     attn_obj = result or {}
                     pooled_obj = {}
                     backbone_obj = {}
+                    logits_obj = {}
 
                 if attn_writer and attn_obj:
                     attn_writer.write_dict(attn_obj)
+                if logits_writer and logits_obj:
+                    logits_writer.write_dict(logits_obj)
                 if pool_writer and pooled_obj:
                     pool_writer.write_dict(pooled_obj)
                 if backbone_writer and backbone_obj:
@@ -521,6 +556,8 @@ def main(
     finally:
         if attn_writer:
             attn_writer.close()
+        if logits_writer:
+            logits_writer.close()
         if pool_writer:
             pool_writer.close()
         if backbone_writer:

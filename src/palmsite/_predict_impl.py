@@ -530,6 +530,11 @@ def backbone_vectors_file_meta(
         "min_p": float(min_p),
         "include_input_controls": bool(include_input),
         "weight_type": "final_attention_w",
+        "logit_fields": {
+            "logit": "Raw model sequence logit before temperature scaling.",
+            "calibrated_logit": "logit / temperature; sigmoid(calibrated_logit) equals P.",
+            "temperature": "Temperature used for probability calibration.",
+        },
         "coordinates": (
             "local_pos are chunk-local 0-based residue indices; abs_pos are 0-based "
             "coordinates in the original unchunked sequence; S_idx/E_idx are chunk-local "
@@ -552,7 +557,10 @@ def compute_backbone_vector_entry(
     orig_start: int,
     orig_len: int,
     P: float,
-    S_norm: float,
+    logit: Optional[float] = None,
+    calibrated_logit: Optional[float] = None,
+    temperature: Optional[float] = None,
+    S_norm: float = 0.0,
     E_norm: float,
     mu: float,
     sigma: float,
@@ -614,6 +622,9 @@ def compute_backbone_vector_entry(
         "orig_start": int(orig_start),
         "orig_len": int(orig_len),
         "P": float(P),
+        "logit": (None if logit is None else float(logit)),
+        "calibrated_logit": (None if calibrated_logit is None else float(calibrated_logit)),
+        "temperature": (None if temperature is None else float(temperature)),
         "S_norm": float(S_norm),
         "E_norm": float(E_norm),
         "S_idx": int(s),
@@ -749,8 +760,13 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
     model.load_state_dict(cleaned, strict=True)
     model.eval()
 
-    # Temperature (prob calibration)
-    T = float(ckpt.get("temperature", 1.0)) if isinstance(ckpt, dict) else 1.0
+    # Temperature for calibrated probabilities/logits.
+    if getattr(args, "temperature", None) is not None:
+        T = float(args.temperature)
+    elif bool(getattr(args, "no_calib", False)):
+        T = 1.0
+    else:
+        T = float(ckpt.get("temperature", 1.0)) if isinstance(ckpt, dict) else 1.0
 
     # IDs subset (optional)
     ids = None
@@ -776,6 +792,7 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
     attn_json: Optional[Dict[str, Any]] = {} if getattr(args, "attn_json", None) else None
     pooled_json: Optional[Dict[str, Any]] = {} if getattr(args, "pooled_json", None) else None
     backbone_json: Optional[Dict[str, Any]] = {} if getattr(args, "backbone_json", None) else None
+    logits_json: Optional[Dict[str, Any]] = {} if getattr(args, "logits_json", None) else None
     want_pools = (pooled_json is not None) or bool(getattr(args, "include_pools_in_attn_json", False))
     want_backbone_vectors = backbone_json is not None
 
@@ -785,7 +802,9 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
             m = b["mask"].to(device)
             L = b["L"].to(device)
             out = model(x, m, L)
-            P = torch.sigmoid(out["logit"] / T).cpu().numpy()
+            raw_logit = out["logit"].detach().float().cpu().numpy()
+            calibrated_logit = raw_logit / float(T)
+            P = 1.0 / (1.0 + np.exp(-calibrated_logit))
 
             if args.discovery:
                 S, E, ent = _attn_hpd_span_from_out(out, m, L, mass=float(args.attn_mass), pos_channel='end_inclusive')
@@ -858,6 +877,9 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
                             "orig_start": ostart,
                             "orig_len": olen_i,
                             "P": float(P[i]),
+                            "logit": float(raw_logit[i]),
+                            "calibrated_logit": float(calibrated_logit[i]),
+                            "temperature": float(T),
                             "S_norm": float(S[i]),
                             "E_norm": float(E[i]),
                             "S_idx": int(s_local),
@@ -885,6 +907,9 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
                             orig_start=ostart,
                             orig_len=olen_i,
                             P=float(P[i]),
+                            logit=float(raw_logit[i]),
+                            calibrated_logit=float(calibrated_logit[i]),
+                            temperature=float(T),
                             S_norm=float(S[i]),
                             E_norm=float(E[i]),
                             mu=float(mu[i]),
@@ -918,6 +943,9 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
 
                             # probability for convenience
                             "P": float(P[i]),
+                            "logit": float(raw_logit[i]),
+                            "calibrated_logit": float(calibrated_logit[i]),
+                            "temperature": float(T),
 
                             # per-residue final attention weights and positions
                             "w": wi.tolist(),
@@ -927,6 +955,27 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
                             attn_entry["pools"] = pools
                             attn_entry["pool_meta"] = pool_meta
                         attn_json[cid] = attn_entry
+
+                    if logits_json is not None:
+                        logits_json[cid] = {
+                            "chunk_id": cid,
+                            "base_id": bid,
+                            "L": Li,
+                            "orig_start": ostart,
+                            "orig_len": olen_i,
+                            "P": float(P[i]),
+                            "logit": float(raw_logit[i]),
+                            "calibrated_logit": float(calibrated_logit[i]),
+                            "temperature": float(T),
+                            "S_norm": float(S[i]),
+                            "E_norm": float(E[i]),
+                            "S_idx": int(s_local),
+                            "E_idx": int(e_local),
+                            "mu": float(mu[i]),
+                            "sigma": float(sigma[i]),
+                            "mu_attn": float(mu_attn[i]),
+                            "sigma_attn": float(sigma_attn[i]),
+                        }
 
             for i, cid in enumerate(b["chunk_ids"]):
                 wcsv.writerow([cid, float(P[i]), float(S[i]), float(E[i]),
@@ -941,7 +990,8 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
                 cand = (float(P[i]), cid, int(aS), int(aE),
                         int(orig_start[i] + mu_idx[i]) + 1,
                         float(sigma[i]), int(orig_len[i]),
-                        float(S[i]), float(E[i]), float(ent[i]))
+                        float(S[i]), float(E[i]), float(ent[i]),
+                        float(raw_logit[i]), float(calibrated_logit[i]))
                 cur = agg.get(bid)
                 if (cur is None) or (cand[0] > cur[0]):
                     agg[bid] = cand
@@ -950,7 +1000,7 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
 
     # Mark which chunk should be used for one-vector-per-original-sequence analyses.
     best_chunk_by_base = {bid: vals[1] for bid, vals in agg.items()}
-    for obj in (attn_json, pooled_json, backbone_json):
+    for obj in (attn_json, pooled_json, backbone_json, logits_json):
         if obj is None:
             continue
         for cid, rec in obj.items():
@@ -995,6 +1045,23 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
             json.dump(payload, fjson, indent=2)
         print(f"Wrote per-residue PalmSite backbone vectors to: {args.backbone_json}")
 
+    # Write compact logits JSON to disk if requested
+    if logits_json is not None and getattr(args, "logits_json", None):
+        os.makedirs(os.path.dirname(args.logits_json) or ".", exist_ok=True)
+        payload = {
+            "_meta": {
+                "schema": "palmsite_logits.v1",
+                "description": "Per-chunk PalmSite raw logits and temperature-calibrated logits.",
+                "logit": "Raw model sequence logit before temperature scaling.",
+                "calibrated_logit": "logit / temperature; sigmoid(calibrated_logit) equals P.",
+                "temperature": float(T),
+            }
+        }
+        payload.update(logits_json)
+        with open(args.logits_json, "w", encoding="utf-8") as fjson:
+            json.dump(payload, fjson, indent=2)
+        print(f"Wrote PalmSite logits to: {args.logits_json}")
+
     # Base-level TSV
     if args.base_out:
         os.makedirs(os.path.dirname(args.base_out) or ".", exist_ok=True)
@@ -1002,7 +1069,7 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
             bw = csv.writer(f)
             bw.writerow(["base_id","P","best_chunk","S_abs","E_abs","mu_abs","sigma","Lorig","S","E","attn_entropy"])
             for bid, v in agg.items():
-                bw.writerow([bid] + list(v))
+                bw.writerow([bid] + list(v[:10]))
 
     # GFF (support "-" for stdout)
     if args.gff_out:
@@ -1016,11 +1083,13 @@ def _run_with_namespace(args: argparse.Namespace) -> None:
         try:
             fgff.write("##gff-version 3\n")
             n_feat = 0
-            for bid, (Pmax, cid, aS, aE, aMu, sig, Lorig, Srel, Erel, ent) in agg.items():
+            for bid, (Pmax, cid, aS, aE, aMu, sig, Lorig, Srel, Erel, ent, raw_logit_best, calibrated_logit_best) in agg.items():
                 if Pmax < float(args.gff_min_P):
                     continue
                 attrs = [f"ID={bid}", "Name=RdRP_catalytic_center",
-                         f"Chunk={cid}", f"P={Pmax:.6f}", f"sigma={sig:.4f}", f"len={Lorig}",
+                         f"Chunk={cid}", f"P={Pmax:.6f}",
+                         f"Logit={raw_logit_best:.6f}", f"CalibratedLogit={calibrated_logit_best:.6f}",
+                         f"Temperature={float(T):.6g}", f"sigma={sig:.4f}", f"len={Lorig}",
                          f"SpanSource={'HPD' if args.discovery else 'kSigma'}",
                          f"AttnMass={args.attn_mass:.2f}", f"AttnEntropy={ent:.6f}"]
                 row = [bid, args.gff_source, args.gff_type, str(aS), str(aE),
@@ -1076,6 +1145,11 @@ def main():
         "--attn-json",
         default=None,
         help="Optional path to write residue-wise attention weights and mu/sigma per chunk as JSON.",
+    )
+    ap.add_argument(
+        "--logits-json",
+        default=None,
+        help="Optional path to write compact per-chunk raw and temperature-calibrated logits as JSON.",
     )
     ap.add_argument(
         "--pooled-json",
@@ -1146,6 +1220,7 @@ def predict_from_h5(embeddings: str, checkpoint: str, out_csv: str,
                     gff_out: str | None = None, gff_min_p: float = 0.0,
                     ids_file: str | None = None,
                     attn_json: str | None = None,
+                    logits_json: str | None = None,
                     backbone_json: str | None = None) -> None:
     """Library-friendly wrapper that calls this module as a CLI in-process."""
     import subprocess
@@ -1160,6 +1235,8 @@ def predict_from_h5(embeddings: str, checkpoint: str, out_csv: str,
         cmd += ['--ids-file', ids_file]
     if attn_json is not None:
         cmd += ['--attn-json', attn_json]
+    if logits_json is not None:
+        cmd += ['--logits-json', logits_json]
     if backbone_json is not None:
         cmd += ['--backbone-json', backbone_json]
     proc = subprocess.run(cmd, text=True, capture_output=True)

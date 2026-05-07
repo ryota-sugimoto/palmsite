@@ -477,6 +477,11 @@ def main():
         help='Optional path to write residue-wise attention weights and mu/sigma per chunk as JSON.'
     )
     ap.add_argument(
+        '--logits-json',
+        default=None,
+        help='Optional path to write compact per-chunk raw and temperature-calibrated logits as JSON.'
+    )
+    ap.add_argument(
         '--pooled-json',
         default=None,
         help='Optional path to write compact pooled backbone vector panels for taxonomy/evolution analyses.'
@@ -692,6 +697,7 @@ def main():
     # Optional JSON for residue-wise attention, compact pooled panels, and
     # per-residue PalmSite backbone vectors.
     attn_json: Optional[Dict[str, Any]] = {} if args.attn_json else None
+    logits_json: Optional[Dict[str, Any]] = {} if args.logits_json else None
     pooled_json: Optional[Dict[str, Any]] = {} if args.pooled_json else None
     backbone_json: Optional[Dict[str, Any]] = {} if args.backbone_json else None
     want_pools = (pooled_json is not None) or bool(args.include_pools_in_attn_json)
@@ -711,9 +717,9 @@ def main():
                 ctx = autocast('cuda', enabled=amp_enabled) if _NEW_AMP else autocast(enabled=amp_enabled)
                 with ctx:
                     out = model(x, mask, L)
-                    logits = out['logit'] / float(T)
-                    P = torch.sigmoid(logits)
-                P = P.detach().cpu().numpy()
+                raw_logit = out['logit'].detach().float().cpu().numpy()
+                calibrated_logit = raw_logit / float(T)
+                P = 1.0 / (1.0 + np.exp(-calibrated_logit))
 
                 if args.discovery:
                     S, E, ent = _attn_hpd_span_from_out(
@@ -752,6 +758,7 @@ def main():
                 # --- per-residue attention JSON and compact pooled-panel JSON storage ---
                 if (
                     (attn_json is not None)
+                    or (logits_json is not None)
                     or (pooled_json is not None)
                     or (backbone_json is not None)
                     or bool(args.include_pools_in_attn_json)
@@ -792,6 +799,9 @@ def main():
                                 "orig_start": ostart,
                                 "orig_len": olen_i,
                                 "P": float(P[i]),
+                                "logit": float(raw_logit[i]),
+                                "calibrated_logit": float(calibrated_logit[i]),
+                                "temperature": float(T),
                                 "S_norm": float(S[i]),
                                 "E_norm": float(E[i]),
                                 "S_idx": int(s_local),
@@ -819,6 +829,9 @@ def main():
                                 orig_start=ostart,
                                 orig_len=olen_i,
                                 P=float(P[i]),
+                                logit=float(raw_logit[i]),
+                                calibrated_logit=float(calibrated_logit[i]),
+                                temperature=float(T),
                                 S_norm=float(S[i]),
                                 E_norm=float(E[i]),
                                 mu=float(mu[i]),
@@ -852,6 +865,9 @@ def main():
 
                                 # probability for convenience
                                 "P": float(P[i]),
+                                "logit": float(raw_logit[i]),
+                                "calibrated_logit": float(calibrated_logit[i]),
+                                "temperature": float(T),
 
                                 # per-residue final attention weights and positions
                                 "w": wi.tolist(),
@@ -861,6 +877,27 @@ def main():
                                 attn_entry["pools"] = pools
                                 attn_entry["pool_meta"] = pool_meta
                             attn_json[cid] = attn_entry
+
+                        if logits_json is not None:
+                            logits_json[cid] = {
+                                "chunk_id": cid,
+                                "base_id": bid,
+                                "L": Li,
+                                "orig_start": ostart,
+                                "orig_len": olen_i,
+                                "P": float(P[i]),
+                                "logit": float(raw_logit[i]),
+                                "calibrated_logit": float(calibrated_logit[i]),
+                                "temperature": float(T),
+                                "S_norm": float(S[i]),
+                                "E_norm": float(E[i]),
+                                "S_idx": int(s_local),
+                                "E_idx": int(e_local),
+                                "mu": float(mu[i]),
+                                "sigma": float(sigma[i]),
+                                "mu_attn": float(mu_attn[i]),
+                                "sigma_attn": float(sigma_attn[i]),
+                            }
 
                 # absolute mapping to original sequence
                 abs_S = orig_start + S_idx
@@ -895,6 +932,8 @@ def main():
                         float(S[i]),
                         float(E[i]),
                         0.0,
+                        float(raw_logit[i]),
+                        float(calibrated_logit[i]),
                     )
                     cur = agg.get(bid)
                     if (cur is None) or (cand[0] > cur[0]):
@@ -931,6 +970,8 @@ def main():
                         g.attrs['base_id'] = bid
                         g.attrs['coords'] = args.h5_coords
                         g.attrs['P'] = float(P[i])
+                        g.attrs['logit'] = float(raw_logit[i])
+                        g.attrs['calibrated_logit'] = float(calibrated_logit[i])
                         g.attrs['S_norm'] = float(S[i])
                         g.attrs['E_norm'] = float(E[i])
                         g.attrs['S_idx'] = int(s_idx)
@@ -1003,7 +1044,9 @@ def main():
                                 padM[j, :t.shape[0]] = Mw[j].to(device)
                             with ctx:
                                 outw = model(padX, padM, padL)
-                                Pw  = torch.sigmoid(outw['logit'] / float(T)).detach().cpu().numpy()
+                                raw_logit_w = outw['logit'].detach().float().cpu().numpy()
+                                calibrated_logit_w = raw_logit_w / float(T)
+                                Pw = 1.0 / (1.0 + np.exp(-calibrated_logit_w))
                                 if args.discovery:
                                     Sw, Ew, _ = _attn_hpd_span_from_out(outw, padM, padL, mass=float(args.attn_mass), pos_channel=pos_channel)
                                 else:
@@ -1024,7 +1067,8 @@ def main():
                                     aMu = int(batch['orig_start'][i].cpu().item()) + s0 + muidx
                                     best = (Pj, f"{batch['chunk_ids'][i]}:win{s0}-{s0+L_w}",
                                             aS, aE, aMu, float(sigw[j]), int(batch['orig_len'][i].cpu().item()),
-                                            float(Sw[j]), float(Ew[j]), 0.0)
+                                            float(Sw[j]), float(Ew[j]), 0.0,
+                                            float(raw_logit_w[j]), float(calibrated_logit_w[j]))
                                     agg[bid_i] = best
 
     # Close HDF5 if open
@@ -1033,7 +1077,7 @@ def main():
 
     # Mark which chunk should be used for one-vector-per-original-sequence analyses.
     best_chunk_by_base = {bid: vals[1] for bid, vals in agg.items()}
-    for obj in (attn_json, pooled_json, backbone_json):
+    for obj in (attn_json, logits_json, pooled_json, backbone_json):
         if obj is None:
             continue
         for cid, rec in obj.items():
@@ -1047,6 +1091,23 @@ def main():
         with open(args.attn_json, 'w', encoding='utf-8') as fjson:
             json.dump(attn_json, fjson, indent=2)
         print(f"Wrote residue-wise attention weights to: {args.attn_json}")
+
+    # Write compact logits JSON if requested
+    if logits_json is not None:
+        os.makedirs(os.path.dirname(args.logits_json) or '.', exist_ok=True)
+        payload = {
+            "_meta": {
+                "schema": "palmsite_logits.v1",
+                "description": "Per-chunk PalmSite raw logits and temperature-calibrated logits.",
+                "logit": "Raw model sequence logit before temperature scaling.",
+                "calibrated_logit": "logit / temperature; sigmoid(calibrated_logit) equals P.",
+                "temperature": float(T),
+            }
+        }
+        payload.update(logits_json)
+        with open(args.logits_json, 'w', encoding='utf-8') as fjson:
+            json.dump(payload, fjson, indent=2)
+        print(f"Wrote PalmSite logits to: {args.logits_json}")
 
     # Write compact pooled panels JSON if requested
     if pooled_json is not None:
@@ -1084,7 +1145,8 @@ def main():
         with open(args.base_out, 'w', newline='', encoding='utf-8') as fbase:
             bw = csv.writer(fbase)
             bw.writerow(['base_id','P','best_chunk_or_window','abs_start_idx','abs_end_idx','abs_mu_idx','sigma','orig_len','S_norm','E_norm','attn_entropy'])
-            for bid, (Pmax, cid, aS, aE, aMu, sig, olen, Sn, En, entv) in agg.items():
+            for bid, vals in agg.items():
+                Pmax, cid, aS, aE, aMu, sig, olen, Sn, En, entv = vals[:10]
                 aS2 = max(0, min(aS, olen-1))
                 aE2 = max(0, min(aE, olen-1))
                 if aE2 < aS2:
@@ -1100,7 +1162,8 @@ def main():
             ksig = getattr(model, 'k_sigma', 2.0)
             span_src = (f"attn_hpd{int(round(float(args.attn_mass)*100))}"
                         if args.discovery else f"attn_mass_k{ksig:.2f}")
-            for bid, (Pmax, cid, aS, aE, aMu, sig, olen, Sn, En, entv) in agg.items():
+            for bid, vals in agg.items():
+                Pmax, cid, aS, aE, aMu, sig, olen, Sn, En, entv, raw_logit_best, calibrated_logit_best = vals
                 if Pmax < float(args.gff_min_P):
                     continue
                 start_1b = int(aS) + 1
@@ -1112,6 +1175,9 @@ def main():
                     "Name=RdRP_domain",
                     f"ChunkOrWindow={cid}",
                     f"P={Pmax:.6f}",
+                    f"Logit={raw_logit_best:.6f}",
+                    f"CalibratedLogit={calibrated_logit_best:.6f}",
+                    f"Temperature={float(T):.6g}",
                     f"sigma={sig:.4f}",
                     f"SpanSource={span_src}",
                     f"AttnMass={float(args.attn_mass):.2f}",

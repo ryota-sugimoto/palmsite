@@ -108,6 +108,8 @@ def predict_to_gff(
     pool_l2_normalize: bool = True,
     return_artifacts: bool = False,
     return_pooled: Optional[bool] = None,
+    logits_json: str | None = None,
+    return_logits: bool = False,
     backbone_json: str | None = None,
     backbone_json_scope: str = "span",
     backbone_json_min_p: float = 0.0,
@@ -120,8 +122,10 @@ def predict_to_gff(
     If attn_json is not None, also write a JSON file with per-chunk
     residue-wise attention details. If pooled_json is provided, write compact
     pooled vectors for zero-shot taxonomy/evolution analyses. The recommended
-    panel is pools.backbone.span_attn_norm. If backbone_json is provided, write
-    per-residue PalmSite backbone H vectors for embedding-alignment analyses.
+    panel is pools.backbone.span_attn_norm. If logits_json is provided, write a
+    compact per-chunk JSON with raw and temperature-calibrated logits. If
+    backbone_json is provided, write per-residue PalmSite backbone H vectors for
+    embedding-alignment analyses.
 
     If return_artifacts is True, return available artifact dictionaries; this is
     used by the streaming CLI to write JSON incrementally.
@@ -157,10 +161,12 @@ def predict_to_gff(
     want_pooled_return = bool(return_artifacts) if return_pooled is None else bool(return_pooled)
     want_pools = (pooled_json is not None) or want_pooled_return or bool(include_pools_in_attn_json)
     want_backbone_vectors = (backbone_json is not None) or bool(return_backbone_vectors)
+    want_logits = (logits_json is not None) or bool(return_logits)
     want_attn = (attn_json is not None) or bool(return_attn) or (bool(include_pools_in_attn_json) and want_pools)
     attn_obj: Optional[Dict[str, Any]] = {} if want_attn else None
     pool_obj: Optional[Dict[str, Any]] = {} if want_pools else None
     backbone_obj: Optional[Dict[str, Any]] = {} if want_backbone_vectors else None
+    logits_obj: Optional[Dict[str, Any]] = {} if want_logits else None
 
     if write_header:
         out_stream.write("##gff-version 3\n")
@@ -172,7 +178,9 @@ def predict_to_gff(
             L = b["L"].to(device)
             o = model(x, m, L)
 
-            P = torch.sigmoid(o["logit"] / T).cpu().numpy()
+            raw_logit = o["logit"].detach().float().cpu().numpy()
+            calibrated_logit = raw_logit / float(T)
+            P = 1.0 / (1.0 + np.exp(-calibrated_logit))
             S = o["S_pred"].cpu().numpy()
             E = o["E_pred"].cpu().numpy()
             mu = o["mu"].cpu().numpy()
@@ -199,6 +207,8 @@ def predict_to_gff(
 
                 bid = _base_id(cid)
                 pi = float(P[i])
+                raw_logit_i = float(raw_logit[i])
+                calibrated_logit_i = float(calibrated_logit[i])
 
                 s_local = max(0, min(int(S_idx[i]), Li - 1))
                 e_local = max(0, min(int(E_idx[i]), Li - 1))
@@ -219,6 +229,8 @@ def predict_to_gff(
                         int(orig_start[i] + mu_idx[i]) + 1,
                         float(sigma[i]),
                         int(orig_len[i]),
+                        raw_logit_i,
+                        calibrated_logit_i,
                     )
 
                 wi = w_full[i, :Li].astype(float, copy=False)
@@ -246,6 +258,9 @@ def predict_to_gff(
                         "orig_start": ostart,
                         "orig_len": olen_i,
                         "P": pi,
+                        "logit": raw_logit_i,
+                        "calibrated_logit": calibrated_logit_i,
+                        "temperature": float(T),
                         "S_norm": float(S[i]),
                         "E_norm": float(E[i]),
                         "S_idx": int(s_local),
@@ -271,6 +286,9 @@ def predict_to_gff(
                         orig_start=ostart,
                         orig_len=olen_i,
                         P=pi,
+                        logit=raw_logit_i,
+                        calibrated_logit=calibrated_logit_i,
+                        temperature=float(T),
                         S_norm=float(S[i]),
                         E_norm=float(E[i]),
                         mu=float(mu[i]),
@@ -296,6 +314,9 @@ def predict_to_gff(
                         "S_idx": int(s_local),
                         "E_idx": int(e_local),
                         "P": pi,
+                        "logit": raw_logit_i,
+                        "calibrated_logit": calibrated_logit_i,
+                        "temperature": float(T),
                         "w": wi.tolist(),
                         "abs_pos": abs_pos,
                     }
@@ -304,8 +325,29 @@ def predict_to_gff(
                         attn_entry["pool_meta"] = pool_meta
                     attn_obj[cid] = attn_entry
 
+                if logits_obj is not None:
+                    logits_obj[cid] = {
+                        "chunk_id": cid,
+                        "base_id": bid,
+                        "L": Li,
+                        "orig_start": ostart,
+                        "orig_len": olen_i,
+                        "P": pi,
+                        "logit": raw_logit_i,
+                        "calibrated_logit": calibrated_logit_i,
+                        "temperature": float(T),
+                        "S_norm": float(S[i]),
+                        "E_norm": float(E[i]),
+                        "S_idx": int(s_local),
+                        "E_idx": int(e_local),
+                        "mu": float(mu[i]),
+                        "sigma": float(sigma[i]),
+                        "mu_attn": float(mu_attn[i]),
+                        "sigma_attn": float(sigma_attn[i]),
+                    }
+
     best_chunk_by_base = {bid: vals[1] for bid, vals in best.items()}
-    for obj in (attn_obj, pool_obj, backbone_obj):
+    for obj in (attn_obj, pool_obj, backbone_obj, logits_obj):
         if obj is None:
             continue
         for cid, rec in obj.items():
@@ -314,7 +356,7 @@ def predict_to_gff(
                 rec["is_best_base_chunk"] = bool(cid == best_chunk_by_base.get(bid))
 
     n = 0
-    for bid, (Pmax, cid, aS, aE, aMu, sig, Lorig) in best.items():
+    for bid, (Pmax, cid, aS, aE, aMu, sig, Lorig, raw_logit_best, calibrated_logit_best) in best.items():
         if Pmax < float(min_p):
             continue
         attrs = [
@@ -322,6 +364,9 @@ def predict_to_gff(
             "Name=RdRP_catalytic_center",
             f"Chunk={cid}",
             f"P={Pmax:.6f}",
+            f"Logit={raw_logit_best:.6f}",
+            f"CalibratedLogit={calibrated_logit_best:.6f}",
+            f"Temperature={float(T):.6g}",
             f"mu={aMu}",
             f"sigma={sig:.4f}",
             f"len={Lorig}",
@@ -364,9 +409,26 @@ def predict_to_gff(
         with open(backbone_json, "w", encoding="utf-8") as fjson:
             json.dump(payload, fjson, indent=2)
 
-    if return_artifacts:
-        return {"attn": attn_obj or {}, "pooled": pool_obj or {}, "backbone_vectors": backbone_obj or {}}
+    if logits_obj is not None and logits_json is not None:
+        os.makedirs(os.path.dirname(logits_json) or ".", exist_ok=True)
+        payload = {
+            "_meta": {
+                "schema": "palmsite_logits.v1",
+                "description": "Per-chunk PalmSite raw logits and temperature-calibrated logits.",
+                "logit": "Raw model sequence logit before temperature scaling.",
+                "calibrated_logit": "logit / temperature; sigmoid(calibrated_logit) equals P.",
+                "temperature": float(T),
+            }
+        }
+        payload.update(logits_obj)
+        with open(logits_json, "w", encoding="utf-8") as fjson:
+            json.dump(payload, fjson, indent=2)
 
+    if return_artifacts:
+        return {"attn": attn_obj or {}, "pooled": pool_obj or {}, "backbone_vectors": backbone_obj or {}, "logits": logits_obj or {}}
+
+    if return_logits:
+        return logits_obj or {}
     if return_attn:
         return attn_obj or {}
     return None

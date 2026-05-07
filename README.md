@@ -18,6 +18,12 @@ As of **v0.2.0**, PalmSite can also optionally output **per-residue attention we
   palmsite --attn-json details.json <fasta>
   ```
 
+* **New:** compact per-chunk logits for perturbation and dose-response analyses:
+
+  ```bash
+  palmsite --logits-json logits.json <fasta>
+  ```
+
 * **New:** compact pooled internal-backbone vectors for zero-shot analysis:
 
   ```bash
@@ -108,11 +114,45 @@ Each entry corresponds to one **embedded chunk** and includes:
     "S_idx": <span_start_index>,
     "E_idx": <span_end_index>,
     "P": <probability>,
+    "logit": <raw_model_logit>,
+    "calibrated_logit": <logit_divided_by_temperature>,
+    "temperature": <probability_calibration_temperature>,
     "w": [... per-residue attention weights ...],
     "abs_pos": [... absolute positions ...]
   }
 }
 ```
+
+---
+
+## **NEW: Logits JSON output**
+
+PalmSite can write a compact per-chunk logits file, useful for perturbation or noise dose-response analysis where probabilities can saturate near 0 or 1.
+
+```bash
+palmsite \
+  -o result.gff \
+  --logits-json logits.json \
+  examples/myproteins.fasta
+```
+
+Each record contains:
+
+```json
+{
+  "chunk_id": {
+    "P": 0.998,
+    "logit": 12.34,
+    "calibrated_logit": 10.12,
+    "temperature": 1.22,
+    "S_idx": 120,
+    "E_idx": 250,
+    "is_best_base_chunk": true
+  }
+}
+```
+
+`logit` is the raw model output before temperature scaling. `calibrated_logit = logit / temperature`, and `sigmoid(calibrated_logit)` equals `P`. Existing `--attn-json`, `--pooled-json`, and `--backbone-json` entries also include these three logit fields.
 
 ---
 
@@ -258,6 +298,7 @@ Usage: palmsite -p 0.5 [-o result.gff] [--attn-json details.json] <fasta ...>
   -v, --verbose                   Debug logs (overrides quiet)
   --keep-tmp                      Keep temp files (sanitized FASTA + per-batch embeddings)
   --attn-json PATH                Write per-residue attention JSON (can be large)
+  --logits-json PATH              Write compact per-chunk logits JSON
   --pooled-json PATH              Write compact pooled backbone vector panels
   --backbone-json PATH            Write per-residue PalmSite backbone H vectors
   --backbone-json-scope [span|full]
