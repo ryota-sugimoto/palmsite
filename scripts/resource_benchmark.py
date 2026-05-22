@@ -37,6 +37,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.optimize import curve_fit
 
 
 PATTERN = re.compile(r"sample_n(?P<n>\d+)_rep(?P<rep>\d+)\.json$")
@@ -47,6 +48,267 @@ def bytes_to_gib(value: float | int | None) -> float | None:
         return None
     return float(value) / (1024 ** 3)
 
+
+def finite_float_or_none(value) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    value = float(value)
+    return value if np.isfinite(value) else None
+
+
+def finite_int_or_none(value) -> int | None:
+    if value is None or pd.isna(value):
+        return None
+    value = float(value)
+    return int(value) if np.isfinite(value) else None
+
+
+def idxmax_or_none(series: pd.Series):
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty:
+        return None
+    return values.idxmax()
+
+
+def run_name_or_none(runs: pd.DataFrame, idx) -> str | None:
+    if idx is None or pd.isna(idx):
+        return None
+    return str(runs.loc[idx, "file"])
+
+
+def fmt_float(value, digits: int = 2, suffix: str = "") -> str:
+    value = finite_float_or_none(value)
+    if value is None:
+        return "not available"
+    return f"{value:.{digits}f}{suffix}"
+
+
+def fmt_run(value) -> str:
+    return str(value) if value is not None and not pd.isna(value) else "not available"
+
+
+def fit_runtime_scaling(runs: pd.DataFrame) -> dict:
+    """Fit wall-clock runtime as a linear function of input sequence count.
+
+    Model:
+        wall_clock_s = intercept_seconds + seconds_per_sequence * n_sequences
+
+    The saturated throughput is the reciprocal of the fitted slope. This is
+    intended to estimate the large-input processing rate after fixed startup
+    overhead becomes negligible.
+    """
+    fit_df = runs[["n_sequences", "wall_clock_s"]].dropna().copy()
+    fit_df = fit_df[np.isfinite(fit_df["n_sequences"]) & np.isfinite(fit_df["wall_clock_s"])]
+
+    if len(fit_df) < 2 or fit_df["n_sequences"].nunique() < 2:
+        return {
+            "seconds_per_sequence": None,
+            "intercept_seconds": None,
+            "r_squared": None,
+            "saturated_throughput_seq_s": None,
+            "fit_n_runs": int(len(fit_df)),
+            "fit_n_input_sizes": int(fit_df["n_sequences"].nunique()),
+        }
+
+    coeffs = np.polyfit(fit_df["n_sequences"], fit_df["wall_clock_s"], 1)
+    seconds_per_sequence = float(coeffs[0])
+    intercept_seconds = float(coeffs[1])
+    predicted = np.polyval(coeffs, fit_df["n_sequences"])
+    ss_res = float(((fit_df["wall_clock_s"] - predicted) ** 2).sum())
+    ss_tot = float(((fit_df["wall_clock_s"] - fit_df["wall_clock_s"].mean()) ** 2).sum())
+    r_squared = 1 - ss_res / ss_tot if ss_tot else 1.0
+    saturated_throughput_seq_s = (
+        1.0 / seconds_per_sequence
+        if seconds_per_sequence > 0
+        else None
+    )
+
+    return {
+        "seconds_per_sequence": seconds_per_sequence,
+        "intercept_seconds": intercept_seconds,
+        "r_squared": float(r_squared),
+        "saturated_throughput_seq_s": saturated_throughput_seq_s,
+        "fit_n_runs": int(len(fit_df)),
+        "fit_n_input_sizes": int(fit_df["n_sequences"].nunique()),
+    }
+
+
+
+def safe_aic_bic(ss_res: float, n_obs: int, n_params: int) -> tuple[float | None, float | None]:
+    """Return AIC/BIC for least-squares fits using residual sum of squares."""
+    if n_obs <= 0 or n_params <= 0 or ss_res < 0:
+        return None, None
+    if ss_res == 0:
+        return float("-inf"), float("-inf")
+    aic = n_obs * np.log(ss_res / n_obs) + 2 * n_params
+    bic = n_obs * np.log(ss_res / n_obs) + n_params * np.log(n_obs)
+    return float(aic), float(bic)
+
+
+def r_squared_from_observed_predicted(observed: np.ndarray, predicted: np.ndarray) -> float | None:
+    """Compute ordinary R² for observed and predicted vectors."""
+    if observed.size == 0 or predicted.size == 0 or observed.size != predicted.size:
+        return None
+    ss_res = float(np.sum((observed - predicted) ** 2))
+    ss_tot = float(np.sum((observed - np.mean(observed)) ** 2))
+    if ss_tot == 0:
+        return 1.0 if ss_res == 0 else None
+    return float(1.0 - ss_res / ss_tot)
+
+
+def exponential_saturation_model(n, saturated_throughput, k_sequences):
+    """Empirical saturation model: y = T_sat * (1 - exp(-n / k))."""
+    return saturated_throughput * (1.0 - np.exp(-n / k_sequences))
+
+
+def hyperbolic_saturation_model(n, saturated_throughput, k_sequences):
+    """Fixed-overhead-like saturation model: y = T_sat * n / (K + n)."""
+    return saturated_throughput * n / (k_sequences + n)
+
+
+def fit_one_throughput_saturation_model(
+    x: np.ndarray,
+    y: np.ndarray,
+    model_name: str,
+    model_func,
+) -> dict:
+    """Fit one two-parameter throughput saturation model."""
+    if x.size < 4 or np.unique(x).size < 3:
+        return {
+            "available": False,
+            "model": model_name,
+            "reason": "Need at least 4 valid runs and 3 unique input sizes.",
+            "saturated_throughput_seq_s": None,
+            "k_sequences": None,
+            "r_squared": None,
+            "aic": None,
+            "bic": None,
+            "fit_n_runs": int(x.size),
+            "fit_n_input_sizes": int(np.unique(x).size),
+        }
+
+    max_y = float(np.max(y))
+    median_x = float(np.median(x))
+    if max_y <= 0 or median_x <= 0:
+        return {
+            "available": False,
+            "model": model_name,
+            "reason": "Input sizes and observed throughputs must be positive.",
+            "saturated_throughput_seq_s": None,
+            "k_sequences": None,
+            "r_squared": None,
+            "aic": None,
+            "bic": None,
+            "fit_n_runs": int(x.size),
+            "fit_n_input_sizes": int(np.unique(x).size),
+        }
+
+    # T_sat should usually be above the largest observed throughput. Keeping the
+    # lower bound slightly below max_y helps the optimizer when data are noisy.
+    p0 = [max_y * 1.25, median_x]
+    lower = [max_y * 0.5, 1e-9]
+    upper = [np.inf, np.inf]
+
+    try:
+        popt, pcov = curve_fit(
+            model_func,
+            x,
+            y,
+            p0=p0,
+            bounds=(lower, upper),
+            maxfev=10000,
+        )
+        predicted = model_func(x, *popt)
+        ss_res = float(np.sum((y - predicted) ** 2))
+        r_squared = r_squared_from_observed_predicted(y, predicted)
+        aic, bic = safe_aic_bic(ss_res, int(y.size), int(len(popt)))
+        standard_errors = []
+        if pcov is not None and np.all(np.isfinite(pcov)):
+            standard_errors = np.sqrt(np.diag(pcov)).tolist()
+
+        return {
+            "available": True,
+            "model": model_name,
+            "saturated_throughput_seq_s": float(popt[0]),
+            "k_sequences": float(popt[1]),
+            "r_squared": r_squared,
+            "rss": ss_res,
+            "aic": aic,
+            "bic": bic,
+            "parameter_standard_errors": {
+                "saturated_throughput_seq_s": finite_float_or_none(standard_errors[0]) if len(standard_errors) > 0 else None,
+                "k_sequences": finite_float_or_none(standard_errors[1]) if len(standard_errors) > 1 else None,
+            },
+            "fit_n_runs": int(x.size),
+            "fit_n_input_sizes": int(np.unique(x).size),
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "model": model_name,
+            "reason": str(exc),
+            "saturated_throughput_seq_s": None,
+            "k_sequences": None,
+            "r_squared": None,
+            "aic": None,
+            "bic": None,
+            "fit_n_runs": int(x.size),
+            "fit_n_input_sizes": int(np.unique(x).size),
+        }
+
+
+def fit_throughput_saturation_models(runs: pd.DataFrame) -> dict:
+    """Fit nonlinear saturation models directly to observed throughput.
+
+    Models:
+        exponential: y = T_sat * (1 - exp(-n / k))
+        hyperbolic:  y = T_sat * n / (k + n)
+
+    The hyperbolic model is mathematically consistent with a fixed-overhead
+    runtime model. The exponential model is an empirical saturation curve.
+    """
+    fit_df = runs[["n_sequences", "observed_throughput_seq_s"]].dropna().copy()
+    fit_df = fit_df[
+        np.isfinite(fit_df["n_sequences"])
+        & np.isfinite(fit_df["observed_throughput_seq_s"])
+        & (fit_df["n_sequences"] > 0)
+        & (fit_df["observed_throughput_seq_s"] > 0)
+    ]
+    x = fit_df["n_sequences"].to_numpy(dtype=float)
+    y = fit_df["observed_throughput_seq_s"].to_numpy(dtype=float)
+
+    fits = {
+        "hyperbolic": fit_one_throughput_saturation_model(
+            x,
+            y,
+            "hyperbolic",
+            hyperbolic_saturation_model,
+        ),
+        "exponential": fit_one_throughput_saturation_model(
+            x,
+            y,
+            "exponential",
+            exponential_saturation_model,
+        ),
+    }
+
+    available = {name: fit for name, fit in fits.items() if fit.get("available")}
+    best_by_aic = None
+    if available:
+        best_by_aic = min(
+            available,
+            key=lambda name: (
+                float("inf") if available[name].get("aic") is None else available[name]["aic"]
+            ),
+        )
+
+    return {
+        "fit_target": "observed_throughput_seq_s",
+        "fit_n_runs": int(x.size),
+        "fit_n_input_sizes": int(np.unique(x).size) if x.size else 0,
+        "best_model_by_aic": best_by_aic,
+        "models": fits,
+    }
 
 def extract_archive(tar_path: Path, extract_dir: Path) -> None:
     if extract_dir.exists():
@@ -157,7 +419,9 @@ def parse_runs(extract_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     runs = pd.DataFrame(run_rows).sort_values(["n_sequences", "rep"]).reset_index(drop=True)
     samples = pd.DataFrame(sample_rows).sort_values(["n_sequences", "rep", "t_rel_s"]).reset_index(drop=True)
 
-    runs["throughput_seq_s"] = runs["n_sequences"] / runs["wall_clock_s"]
+    runs["observed_throughput_seq_s"] = runs["n_sequences"] / runs["wall_clock_s"]
+    # Backward-compatible alias for older downstream code and plots.
+    runs["throughput_seq_s"] = runs["observed_throughput_seq_s"]
 
     live_samples = samples.copy()
     if "live_process_count" in live_samples.columns:
@@ -211,8 +475,8 @@ def summarize_by_size(runs: pd.DataFrame) -> pd.DataFrame:
         reps=("rep", "count"),
         wall_clock_mean_s=("wall_clock_s", "mean"),
         wall_clock_sd_s=("wall_clock_s", "std"),
-        throughput_mean_seq_s=("throughput_seq_s", "mean"),
-        throughput_sd_seq_s=("throughput_seq_s", "std"),
+        observed_throughput_mean_seq_s=("observed_throughput_seq_s", "mean"),
+        observed_throughput_sd_seq_s=("observed_throughput_seq_s", "std"),
         avg_cpu_percent_mean=("avg_cpu_percent", "mean"),
         peak_cpu_percent_mean=("max_cpu_percent", "mean"),
         peak_rss_mean_gib=("peak_rss_gib", "mean"),
@@ -226,23 +490,23 @@ def summarize_by_size(runs: pd.DataFrame) -> pd.DataFrame:
     ).reset_index()
 
     grouped["wall_clock_cv_percent"] = 100 * grouped["wall_clock_sd_s"] / grouped["wall_clock_mean_s"]
-    grouped["throughput_cv_percent"] = 100 * grouped["throughput_sd_seq_s"] / grouped["throughput_mean_seq_s"]
+    grouped["observed_throughput_cv_percent"] = 100 * grouped["observed_throughput_sd_seq_s"] / grouped["observed_throughput_mean_seq_s"]
+    # Backward-compatible aliases for older plotting/table code.
+    grouped["throughput_mean_seq_s"] = grouped["observed_throughput_mean_seq_s"]
+    grouped["throughput_sd_seq_s"] = grouped["observed_throughput_sd_seq_s"]
+    grouped["throughput_cv_percent"] = grouped["observed_throughput_cv_percent"]
     grouped["peak_rss_cv_percent"] = 100 * grouped["peak_rss_sd_gib"] / grouped["peak_rss_mean_gib"]
     grouped["peak_gpu_mem_cv_percent"] = 100 * grouped["peak_gpu_mem_sd_gib"] / grouped["peak_gpu_mem_mean_gib"]
     return grouped
 
 
 def overall_summary(runs: pd.DataFrame, env: dict, program_name: str) -> dict:
-    coeffs = np.polyfit(runs["n_sequences"], runs["wall_clock_s"], 1)
-    predicted = np.polyval(coeffs, runs["n_sequences"])
-    ss_res = float(((runs["wall_clock_s"] - predicted) ** 2).sum())
-    ss_tot = float(((runs["wall_clock_s"] - runs["wall_clock_s"].mean()) ** 2).sum())
-    r2 = 1 - ss_res / ss_tot if ss_tot else 1.0
+    throughput_saturation_fits = fit_throughput_saturation_models(runs)
 
-    peak_rss_idx = runs["peak_rss_bytes"].idxmax()
-    peak_gpu_idx = runs["peak_process_tree_gpu_mem_bytes"].idxmax()
-    peak_cpu_idx = runs["max_cpu_percent"].idxmax()
-    peak_power_idx = runs["peak_power_watts"].idxmax()
+    peak_rss_idx = idxmax_or_none(runs["peak_rss_bytes"])
+    peak_gpu_idx = idxmax_or_none(runs["peak_process_tree_gpu_mem_bytes"])
+    peak_cpu_idx = idxmax_or_none(runs["max_cpu_percent"])
+    peak_power_idx = idxmax_or_none(runs["peak_power_watts"])
 
     return {
         "program_name": program_name,
@@ -261,40 +525,41 @@ def overall_summary(runs: pd.DataFrame, env: dict, program_name: str) -> dict:
             "median_wall_clock_s": float(runs["wall_clock_s"].median()),
             "min_wall_clock_s": float(runs["wall_clock_s"].min()),
             "max_wall_clock_s": float(runs["wall_clock_s"].max()),
-            "mean_throughput_seq_s": float(runs["throughput_seq_s"].mean()),
-            "median_throughput_seq_s": float(runs["throughput_seq_s"].median()),
-            "min_throughput_seq_s": float(runs["throughput_seq_s"].min()),
-            "max_throughput_seq_s": float(runs["throughput_seq_s"].max()),
-            "runtime_vs_sequences_linear_fit": {
-                "seconds_per_sequence": float(coeffs[0]),
-                "intercept_seconds": float(coeffs[1]),
-                "r_squared": float(r2),
-            },
+            "mean_observed_throughput_seq_s": float(runs["observed_throughput_seq_s"].mean()),
+            "median_observed_throughput_seq_s": float(runs["observed_throughput_seq_s"].median()),
+            "min_observed_throughput_seq_s": float(runs["observed_throughput_seq_s"].min()),
+            "max_observed_throughput_seq_s": float(runs["observed_throughput_seq_s"].max()),
+            # Backward-compatible aliases for older report readers.
+            "mean_throughput_seq_s": float(runs["observed_throughput_seq_s"].mean()),
+            "median_throughput_seq_s": float(runs["observed_throughput_seq_s"].median()),
+            "min_throughput_seq_s": float(runs["observed_throughput_seq_s"].min()),
+            "max_throughput_seq_s": float(runs["observed_throughput_seq_s"].max()),
+            "throughput_saturation_fits": throughput_saturation_fits,
         },
         "cpu": {
-            "mean_avg_cpu_percent": float(runs["avg_cpu_percent"].mean()),
-            "max_peak_cpu_percent": float(runs["max_cpu_percent"].max()),
-            "max_peak_cpu_run": runs.loc[peak_cpu_idx, "file"],
-            "mean_peak_rss_gib": float(runs["peak_rss_gib"].mean()),
-            "max_peak_rss_gib": float(runs["peak_rss_gib"].max()),
-            "max_peak_rss_run": runs.loc[peak_rss_idx, "file"],
-            "mean_peak_threads": float(runs["peak_threads"].mean()),
-            "max_peak_threads": int(runs["peak_threads"].max()),
+            "mean_avg_cpu_percent": finite_float_or_none(runs["avg_cpu_percent"].mean()),
+            "max_peak_cpu_percent": finite_float_or_none(runs["max_cpu_percent"].max()),
+            "max_peak_cpu_run": run_name_or_none(runs, peak_cpu_idx),
+            "mean_peak_rss_gib": finite_float_or_none(runs["peak_rss_gib"].mean()),
+            "max_peak_rss_gib": finite_float_or_none(runs["peak_rss_gib"].max()),
+            "max_peak_rss_run": run_name_or_none(runs, peak_rss_idx),
+            "mean_peak_threads": finite_float_or_none(runs["peak_threads"].mean()),
+            "max_peak_threads": finite_int_or_none(runs["peak_threads"].max()),
         },
         "gpu": {
             "gpu_available": bool(runs["gpu_available"].fillna(False).all()),
-            "mean_peak_gpu_memory_gib": float(runs["peak_process_tree_gpu_mem_gib"].mean()),
-            "max_peak_gpu_memory_gib": float(runs["peak_process_tree_gpu_mem_gib"].max()),
-            "max_peak_gpu_memory_run": runs.loc[peak_gpu_idx, "file"],
-            "max_peak_device_memory_gib": float(runs["peak_device_memory_used_gib"].max()),
-            "mean_peak_gpu_util_percent": float(runs["peak_gpu_util_percent"].mean()),
-            "max_peak_gpu_util_percent": float(runs["peak_gpu_util_percent"].max()),
-            "mean_peak_power_watts": float(runs["peak_power_watts"].mean()),
-            "max_peak_power_watts": float(runs["peak_power_watts"].max()),
-            "max_peak_power_run": runs.loc[peak_power_idx, "file"],
-            "mean_observed_gpu_util_percent": float(runs["mean_gpu_util_percent"].mean()),
-            "mean_observed_gpu_memory_gib": float(runs["mean_gpu_process_mem_gib"].mean()),
-            "mean_observed_gpu_power_watts": float(runs["mean_gpu_power_watts"].mean()),
+            "mean_peak_gpu_memory_gib": finite_float_or_none(runs["peak_process_tree_gpu_mem_gib"].mean()),
+            "max_peak_gpu_memory_gib": finite_float_or_none(runs["peak_process_tree_gpu_mem_gib"].max()),
+            "max_peak_gpu_memory_run": run_name_or_none(runs, peak_gpu_idx),
+            "max_peak_device_memory_gib": finite_float_or_none(runs["peak_device_memory_used_gib"].max()),
+            "mean_peak_gpu_util_percent": finite_float_or_none(runs["peak_gpu_util_percent"].mean()),
+            "max_peak_gpu_util_percent": finite_float_or_none(runs["peak_gpu_util_percent"].max()),
+            "mean_peak_power_watts": finite_float_or_none(runs["peak_power_watts"].mean()),
+            "max_peak_power_watts": finite_float_or_none(runs["peak_power_watts"].max()),
+            "max_peak_power_run": run_name_or_none(runs, peak_power_idx),
+            "mean_observed_gpu_util_percent": finite_float_or_none(runs["mean_gpu_util_percent"].mean()),
+            "mean_observed_gpu_memory_gib": finite_float_or_none(runs["mean_gpu_process_mem_gib"].mean()),
+            "mean_observed_gpu_power_watts": finite_float_or_none(runs["mean_gpu_power_watts"].mean()),
         },
     }
 
@@ -354,20 +619,72 @@ def plot_runtime_vs_sequences(runs: pd.DataFrame, out_path: Path, program_name: 
 
 def plot_throughput_vs_sequences(runs: pd.DataFrame, out_path: Path, program_name: str) -> None:
     means = runs.groupby("n_sequences", as_index=False).agg(
-        throughput_mean_seq_s=("throughput_seq_s", "mean"),
-        throughput_sd_seq_s=("throughput_seq_s", "std"),
+        observed_throughput_mean_seq_s=("observed_throughput_seq_s", "mean"),
+        observed_throughput_sd_seq_s=("observed_throughput_seq_s", "std"),
     )
+    throughput_fits = fit_throughput_saturation_models(runs)
 
     plt.figure(figsize=(9, 6))
-    plt.scatter(runs["n_sequences"], runs["throughput_seq_s"], alpha=0.7, label="individual runs")
-    plt.plot(means["n_sequences"], means["throughput_mean_seq_s"], marker="o", linewidth=2, label="mean across reps")
+    plt.scatter(
+        runs["n_sequences"],
+        runs["observed_throughput_seq_s"],
+        alpha=0.7,
+        label="individual runs",
+    )
+    plt.plot(
+        means["n_sequences"],
+        means["observed_throughput_mean_seq_s"],
+        marker="o",
+        linewidth=2,
+        label="mean observed throughput",
+    )
+
+    x_min = float(runs["n_sequences"].min())
+    x_max = float(runs["n_sequences"].max())
+    x_grid = np.linspace(0.0, x_max * 1.05, 300)
+
+    hyperbolic = throughput_fits["models"].get("hyperbolic", {})
+    if hyperbolic.get("available"):
+        t_sat = hyperbolic["saturated_throughput_seq_s"]
+        k_seq = hyperbolic["k_sequences"]
+        plt.plot(
+            x_grid,
+            hyperbolic_saturation_model(x_grid, t_sat, k_seq),
+            linewidth=1.8,
+            label=f"hyperbolic fit T_sat={t_sat:.1f} seq/s",
+        )
+        plt.axhline(
+            t_sat,
+            linestyle="--",
+            linewidth=1.4,
+            label=f"hyperbolic saturation={t_sat:.1f} seq/s",
+        )
+
+    exponential = throughput_fits["models"].get("exponential", {})
+    if exponential.get("available"):
+        t_sat = exponential["saturated_throughput_seq_s"]
+        k_seq = exponential["k_sequences"]
+        plt.plot(
+            x_grid,
+            exponential_saturation_model(x_grid, t_sat, k_seq),
+            linewidth=1.8,
+            linestyle=":",
+            label=f"exponential fit T_sat={t_sat:.1f} seq/s",
+        )
+        plt.axhline(
+            t_sat,
+            linestyle="--",
+            linewidth=1.4,
+            label=f"exponential saturation={t_sat:.1f} seq/s",
+        )
+
+    plt.xlim(left=max(0.0, x_min * 0.8), right=x_max * 1.05)
     plt.xlabel("Number of sequences")
-    plt.ylabel("Throughput (sequences/s)")
+    plt.ylabel("Observed throughput (sequences/s)")
     plt.title(f"{program_name} throughput by input size")
-    plt.legend()
+    plt.legend(fontsize=8)
     plt.tight_layout()
     save_figure(out_path)
-
 
 def plot_peak_memory_vs_sequences(runs: pd.DataFrame, out_path: Path, program_name: str) -> None:
     means = runs.groupby("n_sequences", as_index=False).agg(
@@ -393,13 +710,27 @@ def write_markdown_summary(summary: dict, out_path: Path) -> None:
     gpu = summary["gpu"]
     env = summary["environment"]
     program_name = summary["program_name"]
+    throughput_fits = runtime.get("throughput_saturation_fits") or {}
+    saturation_models = throughput_fits.get("models") or {}
+    hyperbolic_fit = saturation_models.get("hyperbolic") or {}
+    exponential_fit = saturation_models.get("exponential") or {}
+
+    def fit_summary_text(fit: dict) -> str:
+        if not fit.get("available"):
+            return f"not available ({fit.get('reason', 'fit failed')})"
+        return (
+            f"T_sat={fit['saturated_throughput_seq_s']:.2f} sequences/s, "
+            f"K={fit['k_sequences']:.2f} sequences, "
+            f"R²={fit['r_squared']:.4f}, "
+            f"AIC={fit['aic']:.2f}"
+        )
 
     md = f"""# {program_name} benchmark summary
 
 ## Environment
 - CPUs: {env['physical_cpu_count']} physical / {env['logical_cpu_count']} logical
 - System memory: {env['system_memory_gib']:.2f} GiB
-- GPU: {env['gpu_name']} ({env['gpu_memory_gib']:.2f} GiB)
+- GPU: {env.get('gpu_name') or 'not available'} ({fmt_float(env.get('gpu_memory_gib'), 2, ' GiB')})
 - Sampling interval: {env['interval_seconds']} s
 
 ## Coverage
@@ -414,26 +745,29 @@ def write_markdown_summary(summary: dict, out_path: Path) -> None:
 - Mean wall clock: {runtime['mean_wall_clock_s']:.2f} s
 - Median wall clock: {runtime['median_wall_clock_s']:.2f} s
 - Range: {runtime['min_wall_clock_s']:.2f}–{runtime['max_wall_clock_s']:.2f} s
-- Mean throughput: {runtime['mean_throughput_seq_s']:.2f} sequences/s
-- Median throughput: {runtime['median_throughput_seq_s']:.2f} sequences/s
-- Runtime linear fit: {runtime['runtime_vs_sequences_linear_fit']['seconds_per_sequence']:.6f} s/sequence, intercept {runtime['runtime_vs_sequences_linear_fit']['intercept_seconds']:.2f} s, R²={runtime['runtime_vs_sequences_linear_fit']['r_squared']:.4f}
+- Mean observed throughput: {runtime['mean_observed_throughput_seq_s']:.2f} sequences/s
+- Median observed throughput: {runtime['median_observed_throughput_seq_s']:.2f} sequences/s
+- Hyperbolic throughput saturation fit: {fit_summary_text(hyperbolic_fit)}
+- Exponential throughput saturation fit: {fit_summary_text(exponential_fit)}
+- Best nonlinear throughput model by AIC: {throughput_fits.get('best_model_by_aic') or 'not available'}
 
 ## CPU
-- Mean average CPU: {cpu['mean_avg_cpu_percent']:.2f}%
-- Maximum peak CPU: {cpu['max_peak_cpu_percent']:.2f}% ({cpu['max_peak_cpu_run']})
-- Mean peak RSS: {cpu['mean_peak_rss_gib']:.2f} GiB
-- Maximum peak RSS: {cpu['max_peak_rss_gib']:.2f} GiB ({cpu['max_peak_rss_run']})
-- Maximum peak threads: {cpu['max_peak_threads']}
+- Mean average CPU: {fmt_float(cpu['mean_avg_cpu_percent'], 2, '%')}
+- Maximum peak CPU: {fmt_float(cpu['max_peak_cpu_percent'], 2, '%')} ({fmt_run(cpu['max_peak_cpu_run'])})
+- Mean peak RSS: {fmt_float(cpu['mean_peak_rss_gib'], 2, ' GiB')}
+- Maximum peak RSS: {fmt_float(cpu['max_peak_rss_gib'], 2, ' GiB')} ({fmt_run(cpu['max_peak_rss_run'])})
+- Maximum peak threads: {fmt_run(cpu['max_peak_threads'])}
 
 ## GPU
-- Mean observed GPU utilization: {gpu['mean_observed_gpu_util_percent']:.2f}%
-- Mean peak GPU memory: {gpu['mean_peak_gpu_memory_gib']:.2f} GiB
-- Maximum peak GPU memory: {gpu['max_peak_gpu_memory_gib']:.2f} GiB ({gpu['max_peak_gpu_memory_run']})
-- Maximum device memory used: {gpu['max_peak_device_memory_gib']:.2f} GiB
-- Mean peak GPU utilization: {gpu['mean_peak_gpu_util_percent']:.2f}%
-- Maximum peak GPU utilization: {gpu['max_peak_gpu_util_percent']:.2f}%
-- Mean observed GPU power: {gpu['mean_observed_gpu_power_watts']:.2f} W
-- Maximum peak GPU power: {gpu['max_peak_power_watts']:.2f} W ({gpu['max_peak_power_run']})
+- GPU metrics available: {gpu['gpu_available']}
+- Mean observed GPU utilization: {fmt_float(gpu['mean_observed_gpu_util_percent'], 2, '%')}
+- Mean peak GPU memory: {fmt_float(gpu['mean_peak_gpu_memory_gib'], 2, ' GiB')}
+- Maximum peak GPU memory: {fmt_float(gpu['max_peak_gpu_memory_gib'], 2, ' GiB')} ({fmt_run(gpu['max_peak_gpu_memory_run'])})
+- Maximum device memory used: {fmt_float(gpu['max_peak_device_memory_gib'], 2, ' GiB')}
+- Mean peak GPU utilization: {fmt_float(gpu['mean_peak_gpu_util_percent'], 2, '%')}
+- Maximum peak GPU utilization: {fmt_float(gpu['max_peak_gpu_util_percent'], 2, '%')}
+- Mean observed GPU power: {fmt_float(gpu['mean_observed_gpu_power_watts'], 2, ' W')}
+- Maximum peak GPU power: {fmt_float(gpu['max_peak_power_watts'], 2, ' W')} ({fmt_run(gpu['max_peak_power_run'])})
 """
     out_path.write_text(md)
 
@@ -507,4 +841,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
