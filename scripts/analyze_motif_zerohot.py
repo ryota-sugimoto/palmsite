@@ -5,7 +5,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use('Agg')
@@ -44,6 +44,21 @@ def parse_args():
     p.add_argument('--spike-window', type=int, default=6, help='Half-window size for extracted spike-centered sequences')
     p.add_argument('--n-examples', type=int, default=10, help='Number of example sequences to plot')
     p.add_argument('--example-min-length', type=int, default=500, help='Minimum protein length for selected example sequences')
+    p.add_argument(
+        '--motif-pvalue-k',
+        type=int,
+        default=5,
+        help=(
+            'Top-K value whose motif-specific observed-vs-random p-values are annotated on '
+            'the motif-specific proximity panel. If this K is absent from --topk, the nearest '
+            'available K is used. Use --no-motif-pvalue-annotation to suppress annotation.'
+        ),
+    )
+    p.add_argument(
+        '--no-motif-pvalue-annotation',
+        action='store_true',
+        help='Do not annotate motif-specific observed-vs-random p-values on the motif-specific panel.',
+    )
     return p.parse_args()
 
 
@@ -195,6 +210,107 @@ def motif_center(annot: dict, motif: str):
     return pos, center, seq
 
 
+def expected_random_hit_probability(
+    domain_start: int,
+    domain_end: int,
+    motif_center_pos: float,
+    match_radius: int,
+    top_k: int,
+) -> float:
+    """
+    Exact probability that at least one of K uniformly placed random positions
+    inside the predicted domain falls within the motif-centered matching window.
+
+    Random positions are sampled without replacement from integer amino-acid
+    positions in [domain_start, domain_end]. The motif window is clipped to the
+    predicted-domain boundary.
+    """
+    domain_len = int(domain_end - domain_start + 1)
+    if domain_len <= 0:
+        return np.nan
+
+    left = max(int(domain_start), int(math.floor(motif_center_pos - match_radius)))
+    right = min(int(domain_end), int(math.ceil(motif_center_pos + match_radius)))
+    window_len = max(0, right - left + 1)
+    K = min(int(top_k), domain_len)
+
+    if window_len <= 0 or K <= 0:
+        return 0.0
+    if K >= domain_len or (domain_len - window_len) < K:
+        return 1.0
+
+    return 1.0 - math.comb(domain_len - window_len, K) / math.comb(domain_len, K)
+
+
+def proximity_test_against_random(observed: np.ndarray, expected_probs: np.ndarray) -> dict:
+    """
+    One-sided normal approximation for observed proximity > random expectation.
+
+    Each motif occurrence is modeled as a Bernoulli event with probability p_i,
+    where p_i is the exact random-hit probability for that motif, domain length,
+    matching radius, and K. The test statistic is:
+
+        z = (sum(observed_i) - sum(p_i)) / sqrt(sum(p_i * (1 - p_i)))
+
+    The p-value is P[Z >= z] under a standard normal approximation.
+    `minus_log10_p_value_vs_random` is stored to avoid losing information when
+    extremely small p-values underflow to 0.0 in floating-point format.
+    """
+    observed = np.asarray(observed, dtype=float)
+    expected_probs = np.asarray(expected_probs, dtype=float)
+    keep = np.isfinite(observed) & np.isfinite(expected_probs)
+    observed = observed[keep]
+    expected_probs = expected_probs[keep]
+
+    n = int(len(observed))
+    observed_count = float(np.sum(observed)) if n else np.nan
+    expected_count = float(np.sum(expected_probs)) if n else np.nan
+    observed_fraction = float(np.mean(observed)) if n else np.nan
+    expected_fraction = float(np.mean(expected_probs)) if n else np.nan
+    var_sum = float(np.sum(expected_probs * (1.0 - expected_probs))) if n else np.nan
+
+    if n == 0 or not np.isfinite(var_sum) or var_sum <= 0:
+        zstat = np.nan
+        pval = np.nan
+        minus_log10_p = np.nan
+    else:
+        zstat = float((observed_count - expected_count) / math.sqrt(var_sum))
+        pval = float(norm.sf(zstat))
+        minus_log10_p = float(-norm.logsf(zstat) / math.log(10.0))
+
+    return {
+        'n_motifs': n,
+        'observed_count': observed_count,
+        'expected_random_count': expected_count,
+        'observed_fraction': observed_fraction,
+        'expected_random_fraction': expected_fraction,
+        'observed_minus_expected_fraction': (
+            observed_fraction - expected_fraction
+            if np.isfinite(observed_fraction) and np.isfinite(expected_fraction)
+            else np.nan
+        ),
+        'fold_over_random': (
+            observed_fraction / expected_fraction
+            if np.isfinite(observed_fraction) and np.isfinite(expected_fraction) and expected_fraction > 0
+            else np.nan
+        ),
+        'z_statistic_vs_random': zstat,
+        'p_value_vs_random': pval,
+        'minus_log10_p_value_vs_random': minus_log10_p,
+        'p_value_label': format_p_value(pval, minus_log10_p),
+    }
+
+
+def format_p_value(pval: float, minus_log10_p: Optional[float] = None) -> str:
+    if pval is None or not np.isfinite(pval):
+        return 'p = NA'
+    if pval == 0.0 and minus_log10_p is not None and np.isfinite(minus_log10_p):
+        return f'p < 1e-{int(math.floor(minus_log10_p))}'
+    if pval < 1e-300:
+        return 'p < 1e-300'
+    if pval < 1e-3:
+        return f'p = {pval:.1e}'
+    return f'p = {pval:.3g}'
 
 
 def has_all_abc_motifs(annot: dict) -> bool:
@@ -273,27 +389,69 @@ def make_fig_topk(summary_df: pd.DataFrame, program_name: str, outpath: Path):
     plt.close()
 
 
-def make_fig_topk_by_motif(by_motif_df: pd.DataFrame, topk_values: List[int], program_name: str, outpath: Path):
-    plt.figure(figsize=(8, 5))
+def make_fig_topk_by_motif(
+    topk_by_motif_df: pd.DataFrame,
+    topk_values: List[int],
+    program_name: str,
+    outpath: Path,
+    match_radius: int,
+    pvalue_k: Optional[int] = None,
+):
+    fig, ax = plt.subplots(figsize=(8, 5))
     for motif in MOTIF_ORDER:
-        sub = by_motif_df[by_motif_df['group'] == motif]
+        sub = topk_by_motif_df[topk_by_motif_df['group'] == motif].sort_values('top_k')
         if sub.empty:
             continue
-        row = sub.iloc[0]
-        obs = [row[f'top{k}_observed_fraction'] for k in topk_values]
-        exp = [row[f'top{k}_expected_random_fraction'] for k in topk_values]
-        plt.plot(topk_values, obs, marker='o', label=f'Motif {motif} observed', color=MOTIF_COLORS[motif])
-        plt.plot(topk_values, exp, marker='o', linestyle='--', label=f'Motif {motif} random', color=MOTIF_COLORS[motif], alpha=0.55)
-    plt.xlabel('Top-K anomaly spikes considered')
-    plt.ylabel('Fraction of motifs within matching radius')
-    plt.title(f'{program_name}: motif-specific top-K spike proximity')
-    plt.xticks(topk_values)
-    plt.ylim(0, 1)
-    plt.grid(True, alpha=0.3)
-    plt.legend(fontsize=8, ncol=2)
-    plt.tight_layout()
-    plt.savefig(outpath)
-    plt.close()
+        ax.plot(
+            sub['top_k'],
+            sub['observed_fraction'],
+            marker='o',
+            label=f'Motif {motif} observed',
+            color=MOTIF_COLORS[motif],
+        )
+        ax.plot(
+            sub['top_k'],
+            sub['expected_random_fraction'],
+            marker='o',
+            linestyle='--',
+            label=f'Motif {motif} random',
+            color=MOTIF_COLORS[motif],
+            alpha=0.55,
+        )
+
+    ax.set_xlabel('Top-K anomaly peaks considered')
+    ax.set_ylabel(f'Fraction of motif centers within ±{match_radius} aa of a top-K peak')
+    ax.set_title(f'{program_name}: motif-specific proximity of anomaly peaks')
+    ax.set_xticks(topk_values)
+    ax.set_ylim(0, 1)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8, ncol=2)
+
+    if pvalue_k is not None and len(topk_by_motif_df):
+        available_k = sorted(set(int(k) for k in topk_by_motif_df['top_k'].dropna().astype(int)))
+        if available_k:
+            chosen_k = min(available_k, key=lambda k: abs(k - pvalue_k))
+            lines = [f'vs random at K={chosen_k}']
+            for motif in MOTIF_ORDER:
+                row = topk_by_motif_df[(topk_by_motif_df['group'] == motif) & (topk_by_motif_df['top_k'] == chosen_k)]
+                if row.empty:
+                    continue
+                r = row.iloc[0]
+                lines.append(f'{motif}: {r["p_value_label"]}')
+            ax.text(
+                0.02,
+                0.98,
+                '\n'.join(lines),
+                transform=ax.transAxes,
+                va='top',
+                ha='left',
+                fontsize=8,
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='0.7', alpha=0.85),
+            )
+
+    fig.tight_layout()
+    fig.savefig(outpath)
+    plt.close(fig)
 
 
 def make_fig_percentile_box(motif_df: pd.DataFrame, program_name: str, outpath: Path):
@@ -528,40 +686,33 @@ def main():
     # Summary tables.
     summary_rows = []
     by_motif_rows = []
+    topk_by_motif_rows = []
 
     overall_w = wilcoxon(motif_df['percentile'] - 0.5, alternative='greater', zero_method='wilcox') if len(motif_df) else None
 
     for top_k in topk_values:
-        obs = float(motif_df[f'top{top_k}_within_radius'].mean())
-
-        # Exact random expectation per motif under K random positions placed uniformly inside the PalmSite domain.
-        expected_vals = []
-        for _, r in motif_df.iterrows():
-            domain_len = int(r['domain_end'] - r['domain_start'] + 1)
-            left = max(int(r['domain_start']), int(math.floor(r['motif_center'] - args.motif_match_radius)))
-            right = min(int(r['domain_end']), int(math.ceil(r['motif_center'] + args.motif_match_radius)))
-            window_len = max(0, right - left + 1)
-            K = min(top_k, domain_len)
-            if K >= domain_len or (domain_len - window_len) < K:
-                expected = 1.0
-            else:
-                expected = 1.0 - math.comb(domain_len - window_len, K) / math.comb(domain_len, K)
-            expected_vals.append(expected)
-        expected_vals = np.asarray(expected_vals, dtype=float)
-        exp_mean = float(np.mean(expected_vals))
-        var_sum = float(np.sum(expected_vals * (1.0 - expected_vals)))
-        zstat = float((motif_df[f'top{top_k}_within_radius'].sum() - np.sum(expected_vals)) / math.sqrt(var_sum)) if var_sum > 0 else np.nan
-        pval = float(norm.sf(zstat)) if np.isfinite(zstat) else np.nan
+        expected_vals = np.asarray(
+            [
+                expected_random_hit_probability(
+                    int(r['domain_start']),
+                    int(r['domain_end']),
+                    float(r['motif_center']),
+                    args.motif_match_radius,
+                    top_k,
+                )
+                for _, r in motif_df.iterrows()
+            ],
+            dtype=float,
+        )
+        observed_vals = motif_df[f'top{top_k}_within_radius'].to_numpy(dtype=float)
+        test = proximity_test_against_random(observed_vals, expected_vals)
 
         summary_rows.append(
             {
                 'metric': f'top{top_k}_coverage',
                 'top_k': top_k,
                 'match_radius': args.motif_match_radius,
-                'observed_fraction': obs,
-                'expected_random_fraction': exp_mean,
-                'z_statistic_vs_random': zstat,
-                'p_value_vs_random': pval,
+                **test,
             }
         )
 
@@ -598,31 +749,61 @@ def main():
             'n_spike_windows_extracted': int(len(spike_windows_by_motif[label])) if label in spike_windows_by_motif else int(sum(sub['best_peak_distance'] <= args.motif_match_radius)),
         }
         for top_k in topk_values:
-            obs = float(sub[f'top{top_k}_within_radius'].mean())
-            expected_vals = []
-            for _, r in sub.iterrows():
-                domain_len = int(r['domain_end'] - r['domain_start'] + 1)
-                left = max(int(r['domain_start']), int(math.floor(r['motif_center'] - args.motif_match_radius)))
-                right = min(int(r['domain_end']), int(math.ceil(r['motif_center'] + args.motif_match_radius)))
-                window_len = max(0, right - left + 1)
-                K = min(top_k, domain_len)
-                if K >= domain_len or (domain_len - window_len) < K:
-                    expected = 1.0
-                else:
-                    expected = 1.0 - math.comb(domain_len - window_len, K) / math.comb(domain_len, K)
-                expected_vals.append(expected)
-            entry[f'top{top_k}_observed_fraction'] = obs
-            entry[f'top{top_k}_expected_random_fraction'] = float(np.mean(expected_vals))
+            expected_vals = np.asarray(
+                [
+                    expected_random_hit_probability(
+                        int(r['domain_start']),
+                        int(r['domain_end']),
+                        float(r['motif_center']),
+                        args.motif_match_radius,
+                        top_k,
+                    )
+                    for _, r in sub.iterrows()
+                ],
+                dtype=float,
+            )
+            observed_vals = sub[f'top{top_k}_within_radius'].to_numpy(dtype=float)
+            test = proximity_test_against_random(observed_vals, expected_vals)
+
+            entry[f'top{top_k}_observed_count'] = test['observed_count']
+            entry[f'top{top_k}_expected_random_count'] = test['expected_random_count']
+            entry[f'top{top_k}_observed_fraction'] = test['observed_fraction']
+            entry[f'top{top_k}_expected_random_fraction'] = test['expected_random_fraction']
+            entry[f'top{top_k}_observed_minus_expected_fraction'] = test['observed_minus_expected_fraction']
+            entry[f'top{top_k}_fold_over_random'] = test['fold_over_random']
+            entry[f'top{top_k}_z_statistic_vs_random'] = test['z_statistic_vs_random']
+            entry[f'top{top_k}_p_value_vs_random'] = test['p_value_vs_random']
+            entry[f'top{top_k}_minus_log10_p_value_vs_random'] = test['minus_log10_p_value_vs_random']
+            entry[f'top{top_k}_p_value_label'] = test['p_value_label']
+
+            topk_by_motif_rows.append(
+                {
+                    'group': label,
+                    'top_k': top_k,
+                    'match_radius': args.motif_match_radius,
+                    **test,
+                }
+            )
         by_motif_rows.append(entry)
 
     topk_df = pd.DataFrame(summary_rows)
     by_motif_df = pd.DataFrame(by_motif_rows)
+    topk_by_motif_df = pd.DataFrame(topk_by_motif_rows)
     topk_df.to_csv(outdir / 'summary_topk.tsv', sep='\t', index=False)
     by_motif_df.to_csv(outdir / 'summary_by_motif.tsv', sep='\t', index=False)
+    topk_by_motif_df.to_csv(outdir / 'summary_topk_by_motif.tsv', sep='\t', index=False)
 
     # Figures.
     make_fig_topk(topk_df, args.program_name, outdir / 'fig_topk_coverage_vs_random.pdf')
-    make_fig_topk_by_motif(by_motif_df, topk_values, args.program_name, outdir / 'fig_topk_coverage_by_motif.pdf')
+    motif_pvalue_k = None if args.no_motif_pvalue_annotation else args.motif_pvalue_k
+    make_fig_topk_by_motif(
+        topk_by_motif_df,
+        topk_values,
+        args.program_name,
+        outdir / 'fig_topk_coverage_by_motif.pdf',
+        match_radius=args.motif_match_radius,
+        pvalue_k=motif_pvalue_k,
+    )
     make_fig_percentile_box(motif_df, args.program_name, outdir / 'fig_motif_percentile_boxplot.pdf')
     make_fig_distance_hist(motif_df, args.program_name, outdir / 'fig_nearest_peak_distance_histogram.pdf')
 
@@ -644,8 +825,9 @@ def main():
             '================================\n\n'
             'Files:\n'
             '  - summary_overall.tsv: overall dataset summary\n'
-            '  - summary_topk.tsv: observed vs random motif/spike proximity by top-K peaks\n'
-            '  - summary_by_motif.tsv: summary statistics for motifs A/B/C and overall\n'
+            '  - summary_topk.tsv: pooled observed vs random motif/spike proximity by top-K peaks\n'
+            '  - summary_topk_by_motif.tsv: motif-specific and overall observed-vs-random top-K statistics, including z-statistics and p-values\n'
+            '  - summary_by_motif.tsv: summary statistics for motifs A/B/C and overall, including motif-specific top-K statistics in wide format\n'
             '  - motif_level_results.tsv: one row per motif occurrence\n'
             '  - peak_level_results.tsv: one row per detected anomaly peak\n'
             '  - spike_windows_motif_[A|B|C].fasta: extracted spike-centered sequence windows for logo building\n'
@@ -655,10 +837,13 @@ def main():
             '  2) Fit a Gaussian baseline to the attention weights by moment matching.\n'
             '  3) Define anomaly spikes as positive local maxima in the residual (observed - Gaussian baseline), after light Gaussian smoothing and robust z-score scaling.\n'
             '  4) Compare these spikes with catalytic motif positions predicted by palm_annot.\n'
-            '  5) Extract spike-centered sequence windows for downstream sequence-logo analysis.\n'
+            '  5) For each K, compare observed motif-peak proximity against exact random-hit expectations within the PalmSite-predicted domain.\n'
+            '  6) Use a one-sided normal approximation to test whether observed motif-peak proximity exceeds random expectation.\n'
+            '  7) Extract spike-centered sequence windows for downstream sequence-logo analysis.\n'
         )
 
 
 if __name__ == '__main__':
     main()
+
 
