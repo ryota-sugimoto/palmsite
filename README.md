@@ -244,7 +244,7 @@ When `--model-pt` is provided, PalmSite loads that local `.pt` checkpoint direct
 
 ---
 
-Version: **0.2.0**
+Version: **0.2.1**
 
 ---
 
