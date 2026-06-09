@@ -18,23 +18,6 @@ As of **v0.2.0**, PalmSite can also optionally output **per-residue attention we
   palmsite --attn-json details.json <fasta>
   ```
 
-* **New:** compact per-chunk logits for perturbation and dose-response analyses:
-
-  ```bash
-  palmsite --logits-json logits.json <fasta>
-  ```
-
-* **New:** compact pooled internal-backbone vectors for zero-shot analysis:
-
-  ```bash
-  palmsite --pooled-json pooled_panels.json <fasta>
-  ```
-
-* **New:** per-residue final PalmSite backbone vectors for embedding-based residue alignment:
-
-  ```bash
-  palmsite --backbone-json backbone_vectors.json <fasta>
-  ```
 * **High precision and recall AUC** (internal benchmarks):
 
 | Backbone (ESM-C) | Positives vs. Negatives | Positives vs. Rest |
