@@ -634,6 +634,67 @@ def enumerate_control_starts(
     return []
 
 
+def choose_matched_in_span_window(
+    motif_site: MotifSite,
+    all_motif_sites: Dict[str, MotifSite],
+    span: SpanRecord,
+    seq_len: int,
+    window_size: int,
+    exclusion_radius: int,
+    rng: random.Random,
+    used_windows: Sequence[Tuple[int, int]] = (),
+) -> Optional[Tuple[int, int]]:
+    """Choose a non-motif in-span control matched by distance from span center.
+
+    Candidate windows must lie completely inside the PalmSite span and must not
+    overlap the exclusion neighborhood around any annotated A/B/C motif. Among
+    valid candidates, minimize the absolute difference between the candidate's
+    distance from the span center and that of the focal motif. Ties are broken
+    reproducibly with the supplied RNG. Previously selected matched-control
+    windows are avoided when possible.
+    """
+    span_start = max(1, int(span.start_1based))
+    span_end = min(seq_len, int(span.end_1based))
+    starts = enumerate_starts_in_interval(span_start, span_end, window_size)
+    if not starts:
+        return None
+
+    forbidden = []
+    for site in all_motif_sites.values():
+        forbidden.append((max(1, site.center_1based - exclusion_radius), min(seq_len, site.center_1based + exclusion_radius)))
+
+    span_center = (span_start + span_end) / 2.0
+    motif_distance = abs(float(motif_site.center_1based) - span_center)
+    candidates = []
+    for wstart in starts:
+        wend = wstart + window_size - 1
+        if any(not (wend < lo or wstart > hi) for lo, hi in forbidden):
+            continue
+        if any(not (wend < ulo or wstart > uhi) for ulo, uhi in used_windows):
+            continue
+        wcenter = (wstart + wend) / 2.0
+        error = abs(abs(wcenter - span_center) - motif_distance)
+        candidates.append((error, wstart))
+
+    # If distinct/non-overlapping matched windows are impossible, allow overlap
+    # with a previously selected matched control while still excluding motifs.
+    if not candidates and used_windows:
+        for wstart in starts:
+            wend = wstart + window_size - 1
+            if any(not (wend < lo or wstart > hi) for lo, hi in forbidden):
+                continue
+            wcenter = (wstart + wend) / 2.0
+            error = abs(abs(wcenter - span_center) - motif_distance)
+            candidates.append((error, wstart))
+
+    if not candidates:
+        return None
+    best_error = min(x[0] for x in candidates)
+    tied = [wstart for error, wstart in candidates if abs(error - best_error) < 1e-12]
+    wstart = rng.choice(tied)
+    return wstart, wstart + window_size - 1
+
+
 def mutate_window(
     seq: str,
     start_1based: int,
@@ -742,6 +803,7 @@ def make_targets_for_record(
     span_source: str,
     outside_span_margin: int,
     control_replicates: int,
+    matched_control_exclusion_radius: int,
     rng: random.Random,
     skip_writer: SkipWriter,
 ) -> List[Tuple[int, WindowTarget]]:
@@ -799,7 +861,54 @@ def make_targets_for_record(
                 )
             )
 
+        # Matched in-span controls are generated separately for each motif.
+        # They use one fixed non-motif window per motif and then receive the same
+        # number of substitution realizations as the motif-centered target.
+        if "matched_in_span" in controls and span is not None:
+            used_matched_windows: List[Tuple[int, int]] = []
+            for motif in motifs:
+                site = motif_sites.get(motif)
+                if site is None:
+                    continue
+                matched = choose_matched_in_span_window(
+                    motif_site=site,
+                    all_motif_sites=motif_sites,
+                    span=span,
+                    seq_len=seq_len,
+                    window_size=window_size,
+                    exclusion_radius=matched_control_exclusion_radius,
+                    rng=rng,
+                    used_windows=used_matched_windows,
+                )
+                if matched is None:
+                    skip_writer.add(
+                        seq_id,
+                        f"no_valid_matched_in_span_{motif}_window",
+                        f"window_size={window_size};exclusion_radius={matched_control_exclusion_radius};span={span.start_1based}-{span.end_1based}",
+                    )
+                    continue
+                wstart, wend = matched
+                used_matched_windows.append((wstart, wend))
+                targets.append(
+                    (
+                        window_size,
+                        WindowTarget(
+                            target_name=f"matched_in_span_{motif}",
+                            motif=motif,
+                            window_start_1based=wstart,
+                            window_end_1based=wend,
+                            motif_start_1based=str(site.start_1based),
+                            motif_end_1based=str(site.end_1based),
+                            motif_center_1based=str(site.center_1based),
+                            motif_seq=site.seq,
+                            span=span,
+                        ),
+                    )
+                )
+
         for control in controls:
+            if control == "matched_in_span":
+                continue
             if span is None and control != "random_anywhere":
                 continue
 
@@ -919,7 +1028,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--controls",
         default="",
-        help="Comma-separated controls: random_in_span,random_outside_span,random_anywhere.",
+        help="Comma-separated controls: matched_in_span,random_in_span,random_outside_span,random_anywhere.",
     )
     parser.add_argument(
         "--span-source",
@@ -928,6 +1037,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Span source for random_in_span/random_outside_span controls.",
     )
     parser.add_argument("--outside-span-margin", type=int, default=0, help="Minimum residue gap between PalmSite span and random_outside_span control window.")
+    parser.add_argument("--matched-control-exclusion-radius", type=int, default=10, help="Exclude matched in-span control windows that overlap ±N aa around any annotated motif center.")
     parser.add_argument(
         "--gff-feature-types",
         default="",
@@ -955,6 +1065,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         die("--position-tolerance must be >= 0")
     if args.outside_span_margin < 0:
         die("--outside-span-margin must be >= 0")
+    if args.matched_control_exclusion_radius < 0:
+        die("--matched-control-exclusion-radius must be >= 0")
     if not args.fasta.exists():
         die(f"FASTA file does not exist: {args.fasta}")
     if not args.palm_annot.exists():
@@ -979,11 +1091,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for motif in motifs + require_motifs:
         if motif not in valid_motifs:
             die(f"Unsupported motif {motif!r}; supported motifs are A,B,C")
-    valid_controls = {"random_in_span", "random_outside_span", "random_anywhere"}
+    valid_controls = {"matched_in_span", "random_in_span", "random_outside_span", "random_anywhere"}
     for control in controls:
         if control not in valid_controls:
             die(f"Unsupported control {control!r}; supported controls are {','.join(sorted(valid_controls))}")
-    if ("random_in_span" in controls or "random_outside_span" in controls) and args.span_source == "palmsite_gff" and args.palmsite_gff is None:
+    if ("matched_in_span" in controls or "random_in_span" in controls or "random_outside_span" in controls) and args.span_source == "palmsite_gff" and args.palmsite_gff is None:
         die("--palmsite-gff is required when --span-source palmsite_gff is used with span controls")
     if args.strict_gff_span and args.palmsite_gff is None:
         die("--strict-gff-span requires --palmsite-gff")
@@ -1036,6 +1148,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 span_source=args.span_source,
                 outside_span_margin=args.outside_span_margin,
                 control_replicates=control_replicates,
+                matched_control_exclusion_radius=args.matched_control_exclusion_radius,
                 rng=record_rng,
                 skip_writer=skip_writer,
             )
@@ -1067,16 +1180,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
 
             for window_size, target in targets:
-                is_control = target.target_name.startswith("random_")
-                # For controls, --control-replicates was already applied by sampling
-                # independent window starts in make_targets_for_record(). Each control
-                # target therefore gets exactly one substitution realization per rate.
-                n_reps = 1 if is_control else args.replicates
-                perturbation_class = "control" if is_control else "motif_centered"
+                is_random_control = target.target_name.startswith("random_")
+                is_matched_control = target.target_name.startswith("matched_in_span_")
+                # Random controls encode replicate variability by sampling different
+                # window locations. Matched controls instead use one fixed window per
+                # focal motif and receive the same number of substitution realizations
+                # as the motif-centered target, enabling a clean paired comparison.
+                n_reps = 1 if is_random_control else args.replicates
+                perturbation_class = "control" if (is_random_control or is_matched_control) else "motif_centered"
 
                 for mutation_rate in mutation_rates:
                     for rep in range(1, n_reps + 1):
-                        display_rep = int(target.control_window_replicate) if is_control and target.control_window_replicate else rep
+                        display_rep = int(target.control_window_replicate) if is_random_control and target.control_window_replicate else rep
                         rng = random.Random(
                             deterministic_child_seed(
                                 args.seed,
@@ -1230,4 +1345,5 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 

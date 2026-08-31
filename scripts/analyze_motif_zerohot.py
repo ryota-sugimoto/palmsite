@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from Bio import SeqIO
 from scipy.signal import find_peaks
-from scipy.stats import norm, wilcoxon
+from scipy.stats import wilcoxon
 
 
 MOTIF_ORDER = ['A', 'B', 'C']
@@ -44,6 +44,9 @@ def parse_args():
     p.add_argument('--spike-window', type=int, default=6, help='Half-window size for extracted spike-centered sequences')
     p.add_argument('--n-examples', type=int, default=10, help='Number of example sequences to plot')
     p.add_argument('--example-min-length', type=int, default=500, help='Minimum protein length for selected example sequences')
+    p.add_argument('--null-permutations', type=int, default=2000, help='Number of per-sequence circular-shift permutations for motif-proximity null')
+    p.add_argument('--bootstrap-replicates', type=int, default=2000, help='Protein-level bootstrap replicates for 95%% CIs')
+    p.add_argument('--seed', type=int, default=1, help='Random seed for circular-shift null and bootstrap')
     p.add_argument(
         '--motif-pvalue-k',
         type=int,
@@ -178,9 +181,16 @@ def analyze_profile(
 
     peak_idx, props = find_peaks(z, prominence=peak_prominence, distance=peak_distance)
     if len(peak_idx) > 0:
-        order = np.argsort(props['prominences'])[::-1]
-        peak_idx = peak_idx[order]
-        prominences = props['prominences'][order]
+        # Figure 2B uses a null defined within the PalmSite-predicted span, so the
+        # observed peak search space must be the same. Keep only peaks whose
+        # residue positions fall inside the predicted span before ranking.
+        keep = domain_mask[peak_idx]
+        peak_idx = peak_idx[keep]
+        prominences = props['prominences'][keep]
+        if len(peak_idx) > 0:
+            order = np.argsort(prominences)[::-1]
+            peak_idx = peak_idx[order]
+            prominences = prominences[order]
     else:
         prominences = np.array([], dtype=float)
 
@@ -210,96 +220,132 @@ def motif_center(annot: dict, motif: str):
     return pos, center, seq
 
 
-def expected_random_hit_probability(
-    domain_start: int,
-    domain_end: int,
-    motif_center_pos: float,
-    match_radius: int,
-    top_k: int,
-) -> float:
-    """
-    Exact probability that at least one of K uniformly placed random positions
-    inside the predicted domain falls within the motif-centered matching window.
-
-    Random positions are sampled without replacement from integer amino-acid
-    positions in [domain_start, domain_end]. The motif window is clipped to the
-    predicted-domain boundary.
-    """
+def _circular_shift_positions(positions: np.ndarray, domain_start: int, domain_end: int, offset: int) -> np.ndarray:
+    """Circularly shift 1-based peak positions within an inclusive domain."""
     domain_len = int(domain_end - domain_start + 1)
     if domain_len <= 0:
-        return np.nan
-
-    left = max(int(domain_start), int(math.floor(motif_center_pos - match_radius)))
-    right = min(int(domain_end), int(math.ceil(motif_center_pos + match_radius)))
-    window_len = max(0, right - left + 1)
-    K = min(int(top_k), domain_len)
-
-    if window_len <= 0 or K <= 0:
-        return 0.0
-    if K >= domain_len or (domain_len - window_len) < K:
-        return 1.0
-
-    return 1.0 - math.comb(domain_len - window_len, K) / math.comb(domain_len, K)
+        return np.asarray([], dtype=float)
+    pos0 = np.asarray(positions, dtype=int) - int(domain_start)
+    return ((pos0 + int(offset)) % domain_len + int(domain_start)).astype(float)
 
 
-def proximity_test_against_random(observed: np.ndarray, expected_probs: np.ndarray) -> dict:
+def _coverage_for_rows(motif_rows: pd.DataFrame, peaks_by_seq: Dict[str, np.ndarray], top_k: int, match_radius: int) -> np.ndarray:
+    """Observed motif coverage using K_i=min(K, number of in-span peaks)."""
+    covered = np.zeros(len(motif_rows), dtype=float)
+    for i, (_, row) in enumerate(motif_rows.iterrows()):
+        peaks = peaks_by_seq.get(str(row['seqid']), np.asarray([], dtype=float))
+        k_i = min(int(top_k), len(peaks))
+        if k_i > 0:
+            covered[i] = float(np.any(np.abs(peaks[:k_i] - float(row['motif_center'])) <= match_radius))
+    return covered
+
+
+def circular_shift_proximity_test(
+    motif_rows: pd.DataFrame,
+    peak_df: pd.DataFrame,
+    top_k: int,
+    match_radius: int,
+    n_permutations: int,
+    n_bootstrap: int,
+    seed: int,
+) -> dict:
+    """Test motif/peak proximity against a per-sequence circular-shift null.
+
+    Peak positions are restricted to the PalmSite-predicted span upstream. For
+    each protein, K_i=min(K, number of detected in-span peaks) peaks are retained.
+    A null replicate circularly shifts the retained peak set by one random offset
+    within that protein's predicted span, preserving peak count and spacing while
+    breaking alignment to catalytic motifs. Protein IDs, rather than motif rows,
+    are resampled for the bootstrap confidence interval.
     """
-    One-sided normal approximation for observed proximity > random expectation.
+    if len(motif_rows) == 0:
+        return {
+            'n_motifs': 0, 'n_sequences': 0, 'observed_count': np.nan,
+            'observed_fraction': np.nan, 'observed_ci95_low': np.nan,
+            'observed_ci95_high': np.nan, 'expected_random_fraction': np.nan,
+            'expected_random_ci95_low': np.nan, 'expected_random_ci95_high': np.nan,
+            'observed_minus_expected_fraction': np.nan, 'fold_over_random': np.nan,
+            'p_value_vs_random': np.nan, 'minus_log10_p_value_vs_random': np.nan,
+            'p_value_label': 'p = NA', 'null_permutations': int(n_permutations),
+        }
 
-    Each motif occurrence is modeled as a Bernoulli event with probability p_i,
-    where p_i is the exact random-hit probability for that motif, domain length,
-    matching radius, and K. The test statistic is:
+    peaks_by_seq = {}
+    if len(peak_df):
+        for seqid, g in peak_df.groupby('seqid', sort=False):
+            g = g.sort_values('peak_rank')
+            peaks_by_seq[str(seqid)] = g['peak_position'].to_numpy(dtype=float)
 
-        z = (sum(observed_i) - sum(p_i)) / sqrt(sum(p_i * (1 - p_i)))
+    observed = _coverage_for_rows(motif_rows, peaks_by_seq, top_k, match_radius)
+    observed_fraction = float(np.mean(observed))
+    seqids = motif_rows['seqid'].astype(str).unique().tolist()
+    rng = np.random.default_rng(seed)
 
-    The p-value is P[Z >= z] under a standard normal approximation.
-    `minus_log10_p_value_vs_random` is stored to avoid losing information when
-    extremely small p-values underflow to 0.0 in floating-point format.
-    """
-    observed = np.asarray(observed, dtype=float)
-    expected_probs = np.asarray(expected_probs, dtype=float)
-    keep = np.isfinite(observed) & np.isfinite(expected_probs)
-    observed = observed[keep]
-    expected_probs = expected_probs[keep]
+    # Cache row indices and domain bounds per protein.
+    seq_info = []
+    for seqid in seqids:
+        idx = np.flatnonzero(motif_rows['seqid'].astype(str).to_numpy() == seqid)
+        row0 = motif_rows.iloc[int(idx[0])]
+        peaks = peaks_by_seq.get(seqid, np.asarray([], dtype=float))
+        k_i = min(int(top_k), len(peaks))
+        seq_info.append((idx, int(row0['domain_start']), int(row0['domain_end']), peaks[:k_i]))
 
-    n = int(len(observed))
-    observed_count = float(np.sum(observed)) if n else np.nan
-    expected_count = float(np.sum(expected_probs)) if n else np.nan
-    observed_fraction = float(np.mean(observed)) if n else np.nan
-    expected_fraction = float(np.mean(expected_probs)) if n else np.nan
-    var_sum = float(np.sum(expected_probs * (1.0 - expected_probs))) if n else np.nan
+    null_fractions = np.empty(max(0, int(n_permutations)), dtype=float)
+    for b in range(len(null_fractions)):
+        n_hit = 0.0
+        n_total = 0
+        for idx, domain_start, domain_end, peaks in seq_info:
+            domain_len = domain_end - domain_start + 1
+            if len(peaks) > 0 and domain_len > 0:
+                shifted = _circular_shift_positions(peaks, domain_start, domain_end, int(rng.integers(0, domain_len)))
+            else:
+                shifted = np.asarray([], dtype=float)
+            centers = motif_rows.iloc[idx]['motif_center'].to_numpy(dtype=float)
+            if len(shifted) > 0:
+                hits = np.any(np.abs(centers[:, None] - shifted[None, :]) <= match_radius, axis=1)
+                n_hit += float(np.sum(hits))
+            n_total += len(idx)
+        null_fractions[b] = n_hit / n_total if n_total else np.nan
 
-    if n == 0 or not np.isfinite(var_sum) or var_sum <= 0:
-        zstat = np.nan
+    expected_fraction = float(np.nanmean(null_fractions)) if len(null_fractions) else np.nan
+    if len(null_fractions):
+        pval = float((1 + np.sum(null_fractions >= observed_fraction)) / (len(null_fractions) + 1))
+        minus_log10_p = float(-math.log10(pval)) if pval > 0 else np.inf
+        null_ci = tuple(np.nanpercentile(null_fractions, [2.5, 97.5]))
+    else:
         pval = np.nan
         minus_log10_p = np.nan
-    else:
-        zstat = float((observed_count - expected_count) / math.sqrt(var_sum))
-        pval = float(norm.sf(zstat))
-        minus_log10_p = float(-norm.logsf(zstat) / math.log(10.0))
+        null_ci = (np.nan, np.nan)
+
+    # Protein-level bootstrap: resample proteins with replacement and carry all
+    # motif rows from each selected protein together.
+    bootstrap_vals = np.empty(max(0, int(n_bootstrap)), dtype=float)
+    obs_by_seq = []
+    for seqid in seqids:
+        mask = motif_rows['seqid'].astype(str).to_numpy() == seqid
+        obs_by_seq.append(observed[mask])
+    for b in range(len(bootstrap_vals)):
+        chosen = rng.integers(0, len(obs_by_seq), size=len(obs_by_seq))
+        vals = np.concatenate([obs_by_seq[int(i)] for i in chosen])
+        bootstrap_vals[b] = float(np.mean(vals)) if len(vals) else np.nan
+    obs_ci = tuple(np.nanpercentile(bootstrap_vals, [2.5, 97.5])) if len(bootstrap_vals) else (np.nan, np.nan)
 
     return {
-        'n_motifs': n,
-        'observed_count': observed_count,
-        'expected_random_count': expected_count,
+        'n_motifs': int(len(motif_rows)),
+        'n_sequences': int(len(seqids)),
+        'observed_count': float(np.sum(observed)),
         'observed_fraction': observed_fraction,
+        'observed_ci95_low': float(obs_ci[0]),
+        'observed_ci95_high': float(obs_ci[1]),
         'expected_random_fraction': expected_fraction,
-        'observed_minus_expected_fraction': (
-            observed_fraction - expected_fraction
-            if np.isfinite(observed_fraction) and np.isfinite(expected_fraction)
-            else np.nan
-        ),
-        'fold_over_random': (
-            observed_fraction / expected_fraction
-            if np.isfinite(observed_fraction) and np.isfinite(expected_fraction) and expected_fraction > 0
-            else np.nan
-        ),
-        'z_statistic_vs_random': zstat,
+        'expected_random_ci95_low': float(null_ci[0]),
+        'expected_random_ci95_high': float(null_ci[1]),
+        'observed_minus_expected_fraction': observed_fraction - expected_fraction if np.isfinite(expected_fraction) else np.nan,
+        'fold_over_random': observed_fraction / expected_fraction if np.isfinite(expected_fraction) and expected_fraction > 0 else np.nan,
         'p_value_vs_random': pval,
         'minus_log10_p_value_vs_random': minus_log10_p,
         'p_value_label': format_p_value(pval, minus_log10_p),
+        'null_permutations': int(n_permutations),
     }
-
 
 def format_p_value(pval: float, minus_log10_p: Optional[float] = None) -> str:
     if pval is None or not np.isfinite(pval):
@@ -635,9 +681,11 @@ def main():
                 'best_peak_distance': best_peak_distance,
                 'best_peak_rank': best_peak_rank,
                 'best_peak_prominence': best_peak_prominence,
+                'n_in_span_peaks': int(len(peak_positions)),
             }
 
             for top_k in topk_values:
+                row_out[f'top{top_k}_effective_k'] = min(int(top_k), int(len(peak_positions)))
                 if len(peak_positions):
                     row_out[f'top{top_k}_within_radius'] = int(np.any(np.abs(peak_positions[:top_k] - center) <= args.motif_match_radius))
                 else:
@@ -691,22 +739,15 @@ def main():
     overall_w = wilcoxon(motif_df['percentile'] - 0.5, alternative='greater', zero_method='wilcox') if len(motif_df) else None
 
     for top_k in topk_values:
-        expected_vals = np.asarray(
-            [
-                expected_random_hit_probability(
-                    int(r['domain_start']),
-                    int(r['domain_end']),
-                    float(r['motif_center']),
-                    args.motif_match_radius,
-                    top_k,
-                )
-                for _, r in motif_df.iterrows()
-            ],
-            dtype=float,
+        test = circular_shift_proximity_test(
+            motif_df,
+            peak_df,
+            top_k=top_k,
+            match_radius=args.motif_match_radius,
+            n_permutations=args.null_permutations,
+            n_bootstrap=args.bootstrap_replicates,
+            seed=args.seed + 1000 * top_k,
         )
-        observed_vals = motif_df[f'top{top_k}_within_radius'].to_numpy(dtype=float)
-        test = proximity_test_against_random(observed_vals, expected_vals)
-
         summary_rows.append(
             {
                 'metric': f'top{top_k}_coverage',
@@ -749,32 +790,15 @@ def main():
             'n_spike_windows_extracted': int(len(spike_windows_by_motif[label])) if label in spike_windows_by_motif else int(sum(sub['best_peak_distance'] <= args.motif_match_radius)),
         }
         for top_k in topk_values:
-            expected_vals = np.asarray(
-                [
-                    expected_random_hit_probability(
-                        int(r['domain_start']),
-                        int(r['domain_end']),
-                        float(r['motif_center']),
-                        args.motif_match_radius,
-                        top_k,
-                    )
-                    for _, r in sub.iterrows()
-                ],
-                dtype=float,
+            test = circular_shift_proximity_test(
+                sub,
+                peak_df,
+                top_k=top_k,
+                match_radius=args.motif_match_radius,
+                n_permutations=args.null_permutations,
+                n_bootstrap=args.bootstrap_replicates,
+                seed=args.seed + 100000 * (MOTIF_ORDER.index(label) + 1 if label in MOTIF_ORDER else 0) + 1000 * top_k,
             )
-            observed_vals = sub[f'top{top_k}_within_radius'].to_numpy(dtype=float)
-            test = proximity_test_against_random(observed_vals, expected_vals)
-
-            entry[f'top{top_k}_observed_count'] = test['observed_count']
-            entry[f'top{top_k}_expected_random_count'] = test['expected_random_count']
-            entry[f'top{top_k}_observed_fraction'] = test['observed_fraction']
-            entry[f'top{top_k}_expected_random_fraction'] = test['expected_random_fraction']
-            entry[f'top{top_k}_observed_minus_expected_fraction'] = test['observed_minus_expected_fraction']
-            entry[f'top{top_k}_fold_over_random'] = test['fold_over_random']
-            entry[f'top{top_k}_z_statistic_vs_random'] = test['z_statistic_vs_random']
-            entry[f'top{top_k}_p_value_vs_random'] = test['p_value_vs_random']
-            entry[f'top{top_k}_minus_log10_p_value_vs_random'] = test['minus_log10_p_value_vs_random']
-            entry[f'top{top_k}_p_value_label'] = test['p_value_label']
 
             topk_by_motif_rows.append(
                 {
@@ -826,7 +850,7 @@ def main():
             'Files:\n'
             '  - summary_overall.tsv: overall dataset summary\n'
             '  - summary_topk.tsv: pooled observed vs random motif/spike proximity by top-K peaks\n'
-            '  - summary_topk_by_motif.tsv: motif-specific and overall observed-vs-random top-K statistics, including z-statistics and p-values\n'
+            '  - summary_topk_by_motif.tsv: motif-specific and overall observed-vs-random top-K statistics, including circular-shift null statistics and empirical p-values\n'
             '  - summary_by_motif.tsv: summary statistics for motifs A/B/C and overall, including motif-specific top-K statistics in wide format\n'
             '  - motif_level_results.tsv: one row per motif occurrence\n'
             '  - peak_level_results.tsv: one row per detected anomaly peak\n'
@@ -837,13 +861,15 @@ def main():
             '  2) Fit a Gaussian baseline to the attention weights by moment matching.\n'
             '  3) Define anomaly spikes as positive local maxima in the residual (observed - Gaussian baseline), after light Gaussian smoothing and robust z-score scaling.\n'
             '  4) Compare these spikes with catalytic motif positions predicted by palm_annot.\n'
-            '  5) For each K, compare observed motif-peak proximity against exact random-hit expectations within the PalmSite-predicted domain.\n'
-            '  6) Use a one-sided normal approximation to test whether observed motif-peak proximity exceeds random expectation.\n'
-            '  7) Extract spike-centered sequence windows for downstream sequence-logo analysis.\n'
+            '  5) Restrict anomaly peaks to the PalmSite-predicted span and use K_i=min(K, available in-span peaks) for each protein.\n'
+            '  6) Compare observed motif-peak proximity with a per-protein circular-shift null that preserves peak count and spacing.\n'
+            '  7) Estimate observed 95% confidence intervals by protein-level bootstrap resampling.\n'
+            '  8) Extract spike-centered sequence windows for downstream sequence-logo analysis.\n'
         )
 
 
 if __name__ == '__main__':
     main()
+
 
 

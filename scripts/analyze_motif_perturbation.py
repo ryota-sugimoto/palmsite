@@ -53,16 +53,22 @@ except Exception:  # pragma: no cover
 
 TARGET_ORDER = [
     "motif_A",
+    "matched_in_span_A",
     "motif_B",
+    "matched_in_span_B",
     "motif_C",
+    "matched_in_span_C",
     "random_in_span",
     "random_outside_span",
 ]
 
 TARGET_LABELS = {
     "motif_A": "Motif A",
+    "matched_in_span_A": "Matched non-motif A",
     "motif_B": "Motif B",
+    "matched_in_span_B": "Matched non-motif B",
     "motif_C": "Motif C",
+    "matched_in_span_C": "Matched non-motif C",
     "random_in_span": "Random in-span",
     "random_outside_span": "Random outside-span",
 }
@@ -336,15 +342,24 @@ def paired_comparisons(df_agg: pd.DataFrame) -> pd.DataFrame:
     for (w, r), g in df_agg.groupby(["window_size", "mutation_rate"], observed=True):
         pivot = g.pivot_table(index="original_id", columns="target_name", values="logit_loss", aggfunc="mean")
         motifs = [m for m in ["motif_A", "motif_B", "motif_C"] if m in pivot.columns]
+        matched = [m for m in ["matched_in_span_A", "matched_in_span_B", "matched_in_span_C"] if m in pivot.columns]
         if motifs:
             pivot["motif_mean"] = pivot[motifs].mean(axis=1)
+        if matched:
+            pivot["matched_mean"] = pivot[matched].mean(axis=1)
 
         pairs = []
+        for suffix in ["A", "B", "C"]:
+            motif = f"motif_{suffix}"
+            control = f"matched_in_span_{suffix}"
+            if motif in pivot.columns and control in pivot.columns:
+                pairs.append((motif, control))
         for motif in motifs:
             pairs.append((motif, "random_in_span"))
             pairs.append((motif, "random_outside_span"))
         pairs.extend(
             [
+                ("motif_mean", "matched_mean"),
                 ("motif_mean", "random_in_span"),
                 ("motif_mean", "random_outside_span"),
                 ("random_in_span", "random_outside_span"),
@@ -374,6 +389,11 @@ def paired_comparisons(df_agg: pd.DataFrame) -> pd.DataFrame:
                 except Exception:
                     p_w = np.nan
             sd = float(np.nanstd(diff, ddof=1)) if len(diff) > 1 else np.nan
+            # Bootstrap paired differences at the protein level. Because each row
+            # of `diff` is already a within-protein contrast, resampling these
+            # differences preserves the paired design.
+            mean_ci = bootstrap_ci(diff, np.mean, n_boot=1000, seed=7919 + int(w) + int(round(float(r) * 1000)))
+            median_ci = bootstrap_ci(diff, np.median, n_boot=1000, seed=15401 + int(w) + int(round(float(r) * 1000)))
             rows.append(
                 {
                     "window_size": w,
@@ -383,7 +403,11 @@ def paired_comparisons(df_agg: pd.DataFrame) -> pd.DataFrame:
                     "comparison": f"{lhs} - {rhs}",
                     "n_pairs": int(len(diff)),
                     "mean_difference_logit_loss": float(np.nanmean(diff)),
+                    "mean_difference_ci95_low": mean_ci[0],
+                    "mean_difference_ci95_high": mean_ci[1],
                     "median_difference_logit_loss": float(np.nanmedian(diff)),
+                    "median_difference_ci95_low": median_ci[0],
+                    "median_difference_ci95_high": median_ci[1],
                     "q25_difference_logit_loss": float(np.nanpercentile(diff, 25)),
                     "q75_difference_logit_loss": float(np.nanpercentile(diff, 75)),
                     "cohen_dz": float(np.nanmean(diff) / sd) if sd and np.isfinite(sd) and sd > 0 else np.nan,
@@ -454,7 +478,7 @@ def write_topline_report(
     if len(comparisons):
         lines.append("## Key paired comparisons")
         lines.append("")
-        key = comparisons[comparisons["lhs"].isin(["motif_mean", "random_in_span"])]
+        key = comparisons[comparisons["lhs"].isin(["motif_A", "motif_B", "motif_C", "motif_mean", "random_in_span"])]
         key_cols = [
             "window_size",
             "mutation_rate",
@@ -563,7 +587,8 @@ def plot_motif_vs_controls(df_agg: pd.DataFrame, outdir: Path) -> None:
     tmp = df_agg.copy()
     tmp["group"] = tmp["target_name"]
     tmp.loc[tmp["target_name"].isin(["motif_A", "motif_B", "motif_C"]), "group"] = "motif_mean"
-    # First average motifs per original/rate; controls are already one condition per original/rate.
+    tmp.loc[tmp["target_name"].isin(["matched_in_span_A", "matched_in_span_B", "matched_in_span_C"]), "group"] = "matched_mean"
+    # First average motif and matched-control triplets per original/rate.
     group_agg = (
         tmp.groupby(["original_id", "window_size", "mutation_rate", "group"], observed=True)
         .agg(logit_loss=("logit_loss", "mean"))
@@ -584,9 +609,10 @@ def plot_motif_vs_controls(df_agg: pd.DataFrame, outdir: Path) -> None:
             }
         )
     s = pd.DataFrame(rows)
-    order = ["motif_mean", "random_in_span", "random_outside_span"]
+    order = ["motif_mean", "matched_mean", "random_in_span", "random_outside_span"]
     labels = {
         "motif_mean": "Motif A/B/C mean",
+        "matched_mean": "Matched non-motif mean",
         "random_in_span": "Random in-span",
         "random_outside_span": "Random outside-span",
     }
@@ -607,7 +633,7 @@ def plot_motif_vs_controls(df_agg: pd.DataFrame, outdir: Path) -> None:
     ax.axhline(0, linestyle="--", linewidth=1)
     ax.set_xlabel("Mutation rate within perturbed window")
     ax.set_ylabel("Mean PalmSite logit loss\n(original − perturbed)")
-    ax.set_title("Motif-centered perturbation versus control windows")
+    ax.set_title("Motif-centered perturbation versus matched and random controls")
     ax.legend(frameon=False, fontsize=8)
     fig.tight_layout()
     fig.savefig(outdir / "motif_mean_vs_controls_logit_loss.pdf")
@@ -730,4 +756,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
